@@ -1,0 +1,19 @@
+[project]
+name = "genesis"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+
+dependencies = [
+    "gradio",
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "diffusers",
+    "accelerate",
+    "transformers",
+]
+
+#[build-system]
+#requires = ["hatchling"]
+#build-backend = "hatchling.build"
+
