@@ -11,6 +11,10 @@ dependencies = [
     "diffusers",
     "accelerate",
     "transformers",
+    "bitsandbytes",
+    "ftfy",
+    "imageio",
+    "imageio-ffmpeg",
 ]
 
 #[build-system]
