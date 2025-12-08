@@ -23,6 +23,8 @@ class GenesisPipeline:
             self.model_id,
             torch_dtype=torch.float16,
             use_safetensors=True,
+            local_files_only=False,  # first run = download
+            cache_dir="/content/drive/MyDrive/Wan2.1_models",
         )
 
         self.pipe.to("cuda")
