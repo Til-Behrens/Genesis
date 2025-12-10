@@ -1,4 +1,5 @@
-from diffusers import DiffusionPipeline, PipelineQuantizationConfig
+from diffusers import DiffusionPipeline, AutoencoderKLWan, WanPipeline
+from numpy.ma.core import negative
 from transformers import BitsAndBytesConfig
 import torch
 from pathlib import Path
@@ -16,19 +17,30 @@ class GenesisPipeline:
             "5B": "Wan-AI/Wan2.2-TI2V-5B",
         }
 
+        self.model_size = model_size
         self.model_id = model_map.get(model_size, model_map["5B"])
-        print(f"Genesis: Lade Modell -> {self.model_id}")
+        logger.info(f"Lade Modell -> {self.model_id}")
 
-        self.pipe = DiffusionPipeline.from_pretrained(
-            self.model_id,
-            torch_dtype=torch.float16,
-            use_safetensors=True,
-            local_files_only=False,  # first run = download
+        dtype = torch.bfloat16
+        device = "cuda"
+        vae = AutoencoderKLWan.from_pretrained(
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            subfolder="vae",
+            torch_dtype=torch.float32,
+            local_files_only=False,
+            resume_download=True,
             cache_dir="/content/drive/MyDrive/Genesis/models",
         )
 
-        self.pipe.to("cuda")
-        self.pipe.enable_model_cpu_offload()
+        self.pipe = WanPipeline.from_pretrained(
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            vae=vae,
+            torch_dtype=dtype,
+            local_files_only=False,
+            resume_download=True,
+            cache_dir="/content/drive/MyDrive/Genesis/models",
+        )
+        self.pipe.to(device)
 
         logger.info("Modell geladen. GPU: %s | VRAM: %.1f GB",
                     torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU',
@@ -37,16 +49,35 @@ class GenesisPipeline:
     def generate(self, prompt: str, duration_sec: int = 8, output_path: str | None = None):
         frames = max(24, int(duration_sec * 24))
 
-        steps = 50 if "14B" in self.model_id else 20
+        height = 720
+        width = 1280
+        guidance_scale = 4.0,
+        guidance_scale_2 = 3.0,
+        num_inference_steps = 40,
+
+        match self.model_size:
+            case "14b":
+                guidance_scale = 5.0,
+            case "5B":
+                height = 704
+                guidance_scale = 5.0,
+                num_inference_steps = 50,
+            case "1.3b":
+                height = 480,
+                width = 832,
+                guidance_scale = 5.0
+
+        negative_prompt = "blurry, low quality, distorted text, unreadable text"
 
         video = self.pipe(
-            prompt,
-            num_inference_steps=steps,
-            # model specific resolution
-            height=512 if "1.7b" in self.model_id else 480 if "1.3b" in self.model_id else 720,
-            width=512 if "1.7b" in self.model_id else 832 if "1.3b" in self.model_id else 1280,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
             num_frames=frames,
-            guidance_scale=6.0,
+            guidance_scale=guidance_scale,
+            guidance_scale_2=guidance_scale_2,
+            num_inference_steps=num_inference_steps,
         ).frames[0]
 
         if not output_path:
