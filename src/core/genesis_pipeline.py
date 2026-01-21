@@ -17,30 +17,28 @@ class GenesisPipeline:
 
         self.model_size = model_size
         self.model_id = model_map.get(model_size, model_map["5B"])
-        logger.info(f"Lade Modell -> {self.model_id}")
+        logger.info(f"Loading Model -> {self.model_id}")
 
         dtype = torch.bfloat16
         device = "cuda"
         vae = AutoencoderKLWan.from_pretrained(
-            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            self.model_id,
             subfolder="vae",
             torch_dtype=torch.float32,
             local_files_only=False,
-            resume_download=True,
             cache_dir="/content/drive/MyDrive/Genesis/models",
         )
 
         self.pipe = WanPipeline.from_pretrained(
-            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            self.model_id,
             vae=vae,
             torch_dtype=dtype,
             local_files_only=False,
-            resume_download=True,
             cache_dir="/content/drive/MyDrive/Genesis/models",
         )
         self.pipe.to(device)
 
-        logger.info("Modell geladen. GPU: %s | VRAM: %.1f GB",
+        logger.info("Model loaded. GPU: %s | VRAM: %.1f GB",
                     torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU',
                     torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0)
 
@@ -49,9 +47,9 @@ class GenesisPipeline:
 
         height = 720
         width = 1280
-        guidance_scale = 4.0,
-        guidance_scale_2 = 3.0,
-        num_inference_steps = 40,
+        guidance_scale = 4.0
+        guidance_scale_2 = 3.0
+        num_inference_steps = 40
 
         match self.model_size:
             case "14b":
@@ -85,7 +83,7 @@ class GenesisPipeline:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         from diffusers.utils import export_to_video
         export_to_video(video, output_path, fps=24)
-        print(f"Video gespeichert → {output_path}")
+        logger.info(f"Video saved → {output_path}")
         return output_path
 
 

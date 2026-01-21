@@ -15,6 +15,11 @@ dependencies = [
     "ftfy",
     "imageio",
     "imageio-ffmpeg",
+    "peft",
+    "datasets",
+    "tqdm",
+    "logging",
+
 ]
 
 #[build-system]
