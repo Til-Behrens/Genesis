@@ -1,7 +1,6 @@
 [project]
 name = "genesis"
 version = "0.1.0"
-requires-python = ">=3.13,<3.14"
 
 dependencies = [
     "gradio",
@@ -18,8 +17,9 @@ dependencies = [
     "peft",
     "datasets",
     "tqdm",
-    "logging",
-
+    "opencv-python",
+    "pillow",
+    "pyyaml",
 ]
 
 #[build-system]

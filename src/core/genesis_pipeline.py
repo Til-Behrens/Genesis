@@ -2,31 +2,29 @@ from diffusers import AutoencoderKLWan, WanPipeline
 import torch
 from pathlib import Path
 import logging
+from src.core.config import CACHE_DIR, WAN_MODEL_MAP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Genesis")
 
 class GenesisPipeline:
     def __init__(self, model_size: str = "5B"):
-        model_map = {
-            "14b":  "Wan-AI/Wan2.1-T2V-14B-Diffusers",
-            "1.3b": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-            "14B": "Wan-AI/Wan2.2-T2V-A14B",
-            "5B": "Wan-AI/Wan2.2-TI2V-5B",
-        }
-
         self.model_size = model_size
-        self.model_id = model_map.get(model_size, model_map["5B"])
+        self.model_id = WAN_MODEL_MAP.get(model_size, WAN_MODEL_MAP["5B"])
         logger.info(f"Loading Model -> {self.model_id}")
 
-        dtype = torch.bfloat16
-        device = "cuda"
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        if device == "cpu":
+            logger.warning("⚠️  CUDA not available, using CPU (will be slow)")
+
         vae = AutoencoderKLWan.from_pretrained(
             self.model_id,
             subfolder="vae",
             torch_dtype=torch.float32,
             local_files_only=False,
-            cache_dir="/content/drive/MyDrive/Genesis/models",
+            cache_dir=CACHE_DIR,
         )
 
         self.pipe = WanPipeline.from_pretrained(
@@ -34,13 +32,17 @@ class GenesisPipeline:
             vae=vae,
             torch_dtype=dtype,
             local_files_only=False,
-            cache_dir="/content/drive/MyDrive/Genesis/models",
+            cache_dir=CACHE_DIR,
         )
         self.pipe.to(device)
 
-        logger.info("Model loaded. GPU: %s | VRAM: %.1f GB",
-                    torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU',
-                    torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0)
+        if torch.cuda.is_available():
+            logger.info("✓ Model loaded. GPU: %s | VRAM: %.1f GB | Precision: %s",
+                        torch.cuda.get_device_name(0),
+                        torch.cuda.get_device_properties(0).total_memory / 1e9,
+                        "bf16" if dtype == torch.bfloat16 else "fp16")
+        else:
+            logger.info("✓ Model loaded on CPU")
 
     def generate(self, prompt: str, duration_sec: int = 8, output_path: str | None = None):
         frames = max(24, int(duration_sec * 24))
@@ -87,6 +89,21 @@ class GenesisPipeline:
         return output_path
 
 
-# global instance
-# genesis = GenesisPipeline(model_size="1.3b")  # change model size here
-genesis = GenesisPipeline(model_size="5B")
+# Singleton instance (lazy loaded)
+_genesis_instance = None
+_genesis_lock = None
+
+def get_genesis_pipeline(model_size: str = "5B") -> GenesisPipeline:
+    """Get or create the Genesis pipeline instance (singleton)."""
+    global _genesis_instance, _genesis_lock
+
+    if _genesis_lock is None:
+        import threading
+        _genesis_lock = threading.Lock()
+
+    with _genesis_lock:
+        if _genesis_instance is None or _genesis_instance.model_size != model_size:
+            logger.info(f"Initializing Genesis Pipeline ({model_size})...")
+            _genesis_instance = GenesisPipeline(model_size)
+        return _genesis_instance
+

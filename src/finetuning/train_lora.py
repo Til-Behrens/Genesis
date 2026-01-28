@@ -1,70 +1,231 @@
+"""
+LoRA fine-tuning for Wan2.2 using efficient cached latents.
+"""
 from diffusers import WanPipeline, AutoencoderKLWan, UniPCMultistepScheduler
-from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
-from transformers import Trainer, TrainingArguments
+from peft import LoraConfig, get_peft_model
+from transformers import Trainer, TrainingArguments, TrainerCallback
 import torch
-import json
-from pathlib import Path
+import pathlib
 import logging
-
+from typing import Generator, Dict, Any
+from src.finetuning.preprocess_dataset import LatentDataset
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LoRA")
 
-MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
-CACHE_DIR = "/content/drive/MyDrive/Genesis/models"
-DATASET_PATH = "src/finetuning/dataset"       # folder with videos/ + captions.jsonl
-OUTPUT_DIR = "models/lora_checkpoints/tutorial_style"
 
-lora_config = LoraConfig(
-    r=64,
-    lora_alpha=32,
-    target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-    lora_dropout=0.05,
-    bias="none",
-)
+class ProgressCallback(TrainerCallback):
+    """Callback to track training progress."""
 
-vae = AutoencoderKLWan.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=torch.float32)
-pipe = WanPipeline.from_pretrained(
-    MODEL_ID,
-    vae=vae,
-    torch_dtype=torch.bfloat16,
-    cache_dir=CACHE_DIR,
-)
+    def __init__(self, callback_fn=None):
+        self.callback_fn = callback_fn
 
-pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=5.0)
-pipe.enable_model_cpu_offload()
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if self.callback_fn and logs:
+            self.callback_fn(logs)
 
-pipe.transformer = get_peft_model(pipe.transformer, lora_config)
-pipe.transformer.print_trainable_parameters()
 
-# --- loading datasets (JSONL-Format) ---
-# example captions.jsonl:
-# {"file_name": "video_001.mp4", "text": "white slide, title 'pointers', bulletpoints appear one after the other"}
-from datasets import load_dataset
-dataset = load_dataset("video_folder", data_dir=DATASET_PATH, split="train")
+def train_lora_pipeline(
+    model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
+    dataset_path: pathlib.Path | str = None,
+    use_cached_latents: bool = True,
+    latents_cache_dir: pathlib.Path | str = None,
+    output_dir: pathlib.Path | str = "models/lora_checkpoints/tutorial_style",
+    cache_dir: str = "/content/drive/MyDrive/Genesis/models",
+    epochs: int = 5,
+    batch_size: int = 1,
+    grad_accum_steps: int = 4,
+    learning_rate: float = 1e-4,
+    lora_r: int = 64,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    save_steps: int = 100,
+    logging_steps: int = 10,
+    progress_callback = None,
+) -> Generator[Dict[str, Any], None, None]:
+    """
+    Train LoRA on Wan2.2 with efficient preprocessing.
 
-training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
-    num_train_epochs=5,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=4,
-    learning_rate=1e-4,
-    fp16=False,
-    bf16=True,
-    logging_steps=10,
-    save_steps=100,
-    report_to="none",
-)
+    Args:
+        model_id: Model ID to fine-tune
+        dataset_path: Path to dataset folder (with metadata.jsonl)
+        use_cached_latents: Whether to use pre-encoded latents (much faster)
+        latents_cache_dir: Directory with cached latents
+        output_dir: Where to save LoRA weights
+        cache_dir: Model cache directory
+        epochs: Number of training epochs
+        batch_size: Batch size per device
+        grad_accum_steps: Gradient accumulation steps
+        learning_rate: Learning rate
+        lora_r: LoRA rank
+        lora_alpha: LoRA alpha
+        lora_dropout: LoRA dropout
+        save_steps: Save checkpoint every N steps
+        logging_steps: Log every N steps
+        progress_callback: Optional callback for progress updates
 
-trainer = Trainer(
-    model=pipe.transformer,
-    args=training_args,
-    train_dataset=dataset,
-)
-logger.info("Starting LoRA-training on example clips...")
-trainer.train()
+    Yields:
+        Progress updates with format:
+        {"status": "init", "message": str}
+        {"status": "loading", "message": str}
+        {"status": "training", "step": int, "loss": float, "epoch": int}
+        {"status": "complete", "output_dir": str}
+        {"status": "error", "message": str}
+    """
 
-pipe.save_pretrained(OUTPUT_DIR)
+    # CUDA availability check
+    if not torch.cuda.is_available():
+        yield {"status": "error", "message": "CUDA is not available. A CUDA GPU is required for training."}
+        return
 
-logger.info(f"LoRA finished! Saved in {OUTPUT_DIR}")
-logger.info("Use it later with: pipe.load_lora_weights('{OUTPUT_DIR}')")
+    # Detect precision support
+    use_bf16 = torch.cuda.is_bf16_supported()
+    torch_dtype = torch.bfloat16 if use_bf16 else torch.float16
+
+    yield {
+        "status": "init",
+        "message": f"Initializing training on {torch.cuda.get_device_name(0)}",
+        "precision": "bf16" if use_bf16 else "fp16",
+        "device": torch.cuda.get_device_name(0)
+    }
+
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Load VAE
+        yield {"status": "loading", "message": "Loading VAE..."}
+        vae = AutoencoderKLWan.from_pretrained(
+            model_id,
+            subfolder="vae",
+            torch_dtype=torch.float32,
+            cache_dir=cache_dir
+        )
+
+        # Load pipeline
+        yield {"status": "loading", "message": f"Loading {model_id}..."}
+        pipe = WanPipeline.from_pretrained(
+            model_id,
+            vae=vae,
+            torch_dtype=torch_dtype,
+            cache_dir=cache_dir,
+        )
+
+        # Configure scheduler
+        pipe.scheduler = UniPCMultistepScheduler.from_config(
+            pipe.scheduler.config,
+            flow_shift=5.0
+        )
+
+        # Wrap transformer with LoRA
+        yield {"status": "loading", "message": "Applying LoRA configuration..."}
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+            lora_dropout=lora_dropout,
+            bias="none",
+        )
+
+        pipe.transformer = get_peft_model(pipe.transformer, lora_config)
+
+        # Log trainable parameters
+        trainable_params = sum(p.numel() for p in pipe.transformer.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in pipe.transformer.parameters())
+        logger.info(f"Trainable params: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+
+        # Move to CUDA (important: don't use cpu_offload for training!)
+        pipe.transformer.to("cuda")
+
+        # Load dataset
+        yield {"status": "loading", "message": "Loading dataset..."}
+
+        if use_cached_latents and latents_cache_dir:
+            metadata_path = pathlib.Path(dataset_path) / "metadata.jsonl" if dataset_path else pathlib.Path("src/finetuning/dataset/metadata.jsonl")
+            dataset = LatentDataset(latents_cache_dir, metadata_path)
+
+            if len(dataset) == 0:
+                yield {
+                    "status": "error",
+                    "message": f"No cached latents found in {latents_cache_dir}. Please run preprocessing first."
+                }
+                return
+        else:
+            # Fallback to loading videos directly (slower)
+            from datasets import load_dataset
+            dataset = load_dataset("video_folder", data_dir=str(dataset_path), split="train")
+
+        logger.info(f"Dataset loaded: {len(dataset)} samples")
+
+        # Training arguments
+        training_args = TrainingArguments(
+            output_dir=str(output_dir),
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=grad_accum_steps,
+            learning_rate=learning_rate,
+            fp16=not use_bf16,
+            bf16=use_bf16,
+            logging_steps=logging_steps,
+            save_steps=save_steps,
+            save_total_limit=3,  # Keep only last 3 checkpoints
+            report_to="none",
+            logging_dir=str(output_dir / "logs"),
+            remove_unused_columns=False,
+        )
+
+        # Create trainer with callback
+        callback = ProgressCallback(callback_fn=progress_callback)
+
+        trainer = Trainer(
+            model=pipe.transformer,
+            args=training_args,
+            train_dataset=dataset,
+            callbacks=[callback],
+        )
+
+        # Start training
+        yield {"status": "training", "message": "Starting LoRA training...", "total_steps": trainer.state.max_steps if hasattr(trainer.state, 'max_steps') else None}
+
+        logger.info("Starting LoRA training...")
+        trainer.train()
+
+        # Save LoRA weights using PEFT API (not pipe.save_pretrained!)
+        yield {"status": "saving", "message": "Saving LoRA weights..."}
+        pipe.transformer.save_pretrained(output_dir)
+
+        logger.info(f"✓ LoRA training complete! Saved to {output_dir}")
+        logger.info(f"Load with: pipe.load_lora_weights('{output_dir}')")
+
+        yield {
+            "status": "complete",
+            "output_dir": str(output_dir),
+            "message": f"Training complete! LoRA weights saved to {output_dir}"
+        }
+
+    except Exception as e:
+        logger.error(f"Training error: {e}", exc_info=True)
+        yield {"status": "error", "message": f"Training failed: {str(e)}"}
+
+
+# Legacy main for backward compatibility
+def main():
+    """Run training with default settings."""
+    for update in train_lora_pipeline(
+        model_id="Wan-AI/Wan2.2-TI2V-5B",
+        dataset_path="src/finetuning/dataset",
+        use_cached_latents=False,  # Set to True after running preprocessing
+        output_dir="models/lora_checkpoints/tutorial_style",
+    ):
+        if update["status"] == "error":
+            logger.error(update["message"])
+            break
+        elif update["status"] == "training":
+            if "loss" in update:
+                logger.info(f"Step {update.get('step', '?')}: loss = {update['loss']:.4f}")
+        elif update["status"] == "complete":
+            logger.info(update["message"])
+
+
+if __name__ == "__main__":
+    main()
