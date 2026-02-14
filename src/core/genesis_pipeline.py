@@ -2,10 +2,14 @@ from diffusers import AutoencoderKLWan, WanPipeline
 import torch
 from pathlib import Path
 import logging
-from src.core.config import CACHE_DIR, WAN_MODEL_MAP
+from src.core.config import CACHE_DIR, WAN_MODEL_MAP, get_optimal_device, get_device_info
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Genesis")
+
+# Suppress verbose logging from dependencies
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 class GenesisPipeline:
     def __init__(self, model_size: str = "5B"):
@@ -13,11 +17,11 @@ class GenesisPipeline:
         self.model_id = WAN_MODEL_MAP.get(model_size, WAN_MODEL_MAP["5B"])
         logger.info(f"Loading Model -> {self.model_id}")
 
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = get_optimal_device()
+        dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
 
         if device == "cpu":
-            logger.warning("⚠️  CUDA not available, using CPU (will be slow)")
+            logger.warning("⚠️  GPU not available, using CPU (will be slow)")
 
         vae = AutoencoderKLWan.from_pretrained(
             self.model_id,
@@ -36,10 +40,11 @@ class GenesisPipeline:
         )
         self.pipe.to(device)
 
-        if torch.cuda.is_available():
+        device_type, device_name, vram_gb = get_device_info()
+        if device_type == "cuda":
             logger.info("✓ Model loaded. GPU: %s | VRAM: %.1f GB | Precision: %s",
-                        torch.cuda.get_device_name(0),
-                        torch.cuda.get_device_properties(0).total_memory / 1e9,
+                        device_name,
+                        vram_gb,
                         "bf16" if dtype == torch.bfloat16 else "fp16")
         else:
             logger.info("✓ Model loaded on CPU")

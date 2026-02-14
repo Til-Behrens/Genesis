@@ -4,9 +4,7 @@ version = "0.1.0"
 
 dependencies = [
     "gradio",
-    "torch",
-    "torchvision",
-    "torchaudio",
+    # torch, torchvision, torchaudio installed by setup_genesis.py
     "diffusers",
     "accelerate",
     "transformers",
@@ -20,6 +18,8 @@ dependencies = [
     "opencv-python",
     "pillow",
     "pyyaml",
+    "openai-whisper",
+    "qwen-vl-utils",
 ]
 
 #[build-system]

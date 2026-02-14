@@ -1,15 +1,42 @@
 import json
-import yaml
 from pathlib import Path
 import cv2
 from PIL import Image
 import torch
-from transformers import MllamaForConditionalGeneration, AutoProcessor
+import subprocess
+import tempfile
+import atexit
+import gc
+from transformers import (
+    VisionEncoderDecoderModel,
+    AutoTokenizer,
+    ViTImageProcessor,
+    BlipProcessor,
+    BlipForConditionalGeneration,
+    Blip2Processor,
+    Blip2ForConditionalGeneration,
+    pipeline,
+    AutoProcessor,
+    Qwen3VLForConditionalGeneration,
+)
 import logging
 from typing import Generator, Dict, Any, Optional
 
+from src.core.config import (
+    CAPTION_MODELS,
+    CAPTION_BACKEND,
+    CAPTION_MAX_FRAMES,
+    CAPTION_USE_SUMMARIZER,
+    CAPTION_SUMMARIZER_ID,
+    get_optimal_device,
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CaptionGen")
+
+# Suppress verbose logging from dependencies
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 SYSTEM_PROMPT = """**Situation**
@@ -38,98 +65,706 @@ Der Prompt muss in deutscher Sprache verfasst werden und die spezifischen Konven
 Die Assistenz soll ausschließlich den fertigen Text-to-Video-Prompt ausgeben ohne jegliche Einleitung, Erklärung, Metakommentare oder abschließende Bemerkungen. Der Prompt beginnt direkt mit der Beschreibung des Videos."""
 
 
-class CaptionGenerator:
-    """Lazy-loading caption generator using Llama Vision."""
+# Audio extraction and transcription utilities
+def extract_audio_from_video(video_path: Path | str, output_wav: Path | str) -> bool:
+    """Extract audio from video file to WAV format using ffmpeg.
+
+    Returns:
+        True if extraction successful, False otherwise.
+    """
+    try:
+        # Extract audio with specific format for Whisper compatibility
+        # - vn: no video
+        # - acodec pcm_s16le: 16-bit PCM audio codec
+        # - ar 16000: 16kHz sample rate (Whisper's native rate)
+        # - ac 1: mono audio
+        subprocess.run(
+            [
+                "ffmpeg", "-i", str(video_path),
+                "-vn",  # No video
+                "-acodec", "pcm_s16le",  # 16-bit PCM
+                "-ar", "16000",  # 16kHz sample rate
+                "-ac", "1",  # Mono
+                "-y",  # Overwrite output file
+                str(output_wav)
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=300,
+            check=True,
+        )
+        output_file = Path(output_wav)
+        if output_file.exists() and output_file.stat().st_size > 0:
+            return True
+        return False
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"FFmpeg failed to extract audio from {video_path}: {e}")
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to extract audio from {video_path}: {e}")
+        return False
+
+
+def transcribe_audio_whisper(audio_path: Path | str, whisper_model: Any) -> str:
+    """Transcribe audio to text using Whisper model.
+
+    Note: whisper_model here is actually an ASRPipeline, but we access its underlying
+    model and processor directly to avoid the "num_frames" KeyError in the pipeline.
+
+    Handles short audio clips (typically 8 seconds from video clips).
+
+    Returns:
+        Transcribed text or empty string if transcription failed.
+    """
+    try:
+        import wave
+        import numpy as np
+        import torch
+
+        # Read the WAV file manually to avoid pipeline issues with file paths
+        with wave.open(str(audio_path), 'rb') as wav_file:
+            # Get audio parameters
+            n_channels = wav_file.getnchannels()
+            framerate = wav_file.getframerate()
+            n_frames = wav_file.getnframes()
+
+            # Read all frames
+            audio_data = wav_file.readframes(n_frames)
+
+            # Convert byte data to numpy array
+            audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # If stereo, convert to mono by taking mean
+            if n_channels > 1:
+                audio_array = audio_array.reshape(-1, n_channels).mean(axis=1)
+
+        # Get the underlying model and feature extractor from the pipeline
+        model = whisper_model.model
+        feature_extractor = whisper_model.feature_extractor
+        tokenizer = whisper_model.tokenizer
+
+        # Process audio using feature extractor directly
+        # This bypasses the pipeline's problematic preprocessing
+        inputs = feature_extractor(
+            audio_array,
+            sampling_rate=framerate,
+            return_tensors="pt"
+        )
+
+        # Ensure inputs are on the same device as the model
+        device = next(model.parameters()).device
+        for key in inputs:
+            if torch.is_tensor(inputs[key]):
+                inputs[key] = inputs[key].to(device)
+
+        # Generate token IDs
+        with torch.no_grad():
+            predicted_ids = model.generate(
+                inputs["input_features"],
+                max_new_tokens=128
+            )
+
+        # Decode tokens to text
+        text = tokenizer.batch_decode(
+            predicted_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )
+
+        if text and text[0]:
+            return text[0].strip()
+        return ""
+
+    except Exception as e:
+        logger.warning(f"Whisper transcription failed for {audio_path}: {e}")
+        return ""
+
+
+
+class BaseCaptionGenerator:
+    """Interface for caption generator implementations."""
 
     def __init__(self, model_id: str, cache_dir: str):
         self.model_id = model_id
         self.cache_dir = cache_dir
-        self.model = None
-        self.processor = None
 
-    def load_model(self):
-        """Load model and processor (lazy initialization)."""
-        if self.model is not None:
-            return
-
-        logger.info(f"Loading {self.model_id}...")
-        self.processor = AutoProcessor.from_pretrained(
-            self.model_id,
-            cache_dir=self.cache_dir
-        )
-        self.model = MllamaForConditionalGeneration.from_pretrained(
-            self.model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            cache_dir=self.cache_dir,
-            local_files_only=False,
-        )
-        logger.info("✓ Caption model loaded")
 
     def video_to_frames(self, video_path: Path, max_frames: int = 8) -> list[Image.Image]:
-        """Extracts evenly distributed frames from a video."""
+        """
+        Intelligently extracts frames from a video based on scene changes.
+
+        Uses pixel difference detection to find keyframes where content changes.
+        For static content (e.g., code editor unchanged), returns 1 frame.
+        For dynamic content, returns up to max_frames frames at change points.
+
+        This ensures:
+        - Static tutorial videos get ONE caption (not 8 identical ones)
+        - Dynamic videos get proper frame sampling showing progression
+        """
         cap = cv2.VideoCapture(str(video_path))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames == 0:
+            cap.release()
             return []
 
-        frames = []
-        indices = [int(i * total_frames / max_frames) for i in range(max_frames)]
+        # Read all frames (or sample if too many)
+        sample_interval = max(1, total_frames // (max_frames * 4))  # Sample densely for change detection
+        all_frames = []
+        frame_indices = []
 
-        for idx in indices:
+        for idx in range(0, total_frames, sample_interval):
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if ret:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(frame))
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                all_frames.append(frame_rgb)
+                frame_indices.append(idx)
 
         cap.release()
-        return frames
 
-    def generate_caption(self, frames: list[Image.Image]) -> str:
-        """Generate caption from video frames."""
-        self.load_model()  # Ensure model is loaded
+        if not all_frames:
+            return []
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"} for _ in frames
-                ] + [{"type": "text", "text": SYSTEM_PROMPT}]
-            }
-        ]
+        # Detect keyframes based on pixel differences
+        keyframe_indices = [0]  # Always include first frame
 
-        input_text = self.processor.apply_chat_template(messages, add_generation_prompt=True)
-        inputs = self.processor(frames, input_text, return_tensors="pt").to(self.model.device)
+        # Lower threshold to detect more subtle changes (tutorial videos often have small changes)
+        threshold = 0.5  # Pixel difference threshold (0-255 scale, per channel)
 
-        with torch.no_grad():
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=120,
-                do_sample=False,
-                temperature=0.1,
+        for i in range(1, len(all_frames)):
+            prev_frame = all_frames[i - 1]
+            curr_frame = all_frames[i]
+
+            # Compute mean absolute difference
+            diff = cv2.absdiff(prev_frame.astype('float32'), curr_frame.astype('float32'))
+            mean_diff = diff.mean()
+
+            # If difference is significant, mark as keyframe
+            if mean_diff > threshold:
+                keyframe_indices.append(i)
+
+        # Don't force include last frame since clips overlap
+        # and the last frame of one clip is similar to the first frame of the next
+
+        # Limit to max_frames by selecting evenly spaced keyframes
+        if len(keyframe_indices) > max_frames:
+            step = len(keyframe_indices) / max_frames
+            keyframe_indices = [keyframe_indices[int(j * step)] for j in range(max_frames)]
+
+        # Extract keyframes as PIL Images
+        result_frames = []
+        for idx in keyframe_indices:
+            frame_array = all_frames[idx]
+            result_frames.append(Image.fromarray(frame_array))
+
+        logger.info(f"Selected {len(result_frames)} keyframes from {total_frames} total frames based on pixel changes")
+        return result_frames
+
+
+class VitGpt2Generator(BaseCaptionGenerator):
+    """Lightweight ViT-GPT2 image captioning generator (default).
+
+    Uses VisionEncoderDecoderModel directly with processor for image captioning.
+    This is chosen as the default because it is small and runs well under 16GB VRAM.
+    """
+
+    def __init__(self, model_id: str, cache_dir: str, device: Optional[str] = None):
+        super().__init__(model_id, cache_dir)
+        if device is None:
+            self.device = get_optimal_device()
+        else:
+            self.device = device
+        self.model = None
+        self.feature_extractor = None
+        self.tokenizer = None
+        # Register cleanup on exit
+        atexit.register(self.cleanup)
+
+    def cleanup(self):
+        """Explicitly free VRAM by deleting model and clearing cache."""
+        if self.model is not None:
+            logger.info("Cleaning up VitGpt2 model from VRAM...")
+            del self.model
+            self.model = None
+        if self.feature_extractor is not None:
+            del self.feature_extractor
+            self.feature_extractor = None
+        if self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def load_model(self):
+        if self.model is not None:
+            return
+
+        logger.info(f"Loading image captioning model: {self.model_id} (device={self.device})...")
+        try:
+            # Load feature extractor for image preprocessing
+            # Try to load from cache first, then from pretrained
+            try:
+                self.feature_extractor = ViTImageProcessor.from_pretrained(
+                    self.model_id,
+                    cache_dir=self.cache_dir,
+                    local_files_only=True,  # Use cached models without network calls
+                )
+            except Exception as e:
+                logger.warning(f"Could not load ViTImageProcessor from cache, using default: {e}")
+                # Use default ViT image processor configuration
+                self.feature_extractor = ViTImageProcessor(
+                    size={"height": 384, "width": 384},
+                    do_normalize=True,
+                    image_mean=[0.5, 0.5, 0.5],
+                    image_std=[0.5, 0.5, 0.5],
+                )
+
+            # Load the vision-encoder-decoder model
+            self.model = VisionEncoderDecoderModel.from_pretrained(
+                self.model_id,
+                cache_dir=self.cache_dir,
+                local_files_only=True,  # Use cached models without network calls
+            ).to(self.device)
+
+            # Load tokenizer for decoding
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_id,
+                cache_dir=self.cache_dir,
+                local_files_only=True,  # Use cached models without network calls
             )
 
-        result = self.processor.decode(output[0], skip_special_tokens=True)
-        return result.strip().strip('"').strip("'")
+            self.model.eval()
+
+        except Exception as e:
+            logger.error(f"Failed to load model {self.model_id}: {e}")
+            raise
+
+        logger.info("✓ Caption model loaded")
+
+    def generate_caption(self, frames: list[Image.Image]) -> str:
+        self.load_model()
+
+        if not frames:
+            return "weißes Bild mit Text"
+
+        # Process each frame and generate descriptions
+        try:
+            frame_descriptions = []
+            for i, frame in enumerate(frames):
+                # Prepare inputs using feature extractor (not processor)
+                pixel_values = self.feature_extractor(
+                    images=frame,
+                    return_tensors="pt"
+                ).pixel_values.to(self.device)
+
+                # Generate caption
+                with torch.no_grad():
+                    output_ids = self.model.generate(
+                        pixel_values,
+                        max_length=50,
+                        num_beams=3,
+                        early_stopping=True
+                    )
+
+                # Decode the generated text
+                caption = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                frame_descriptions.append(f"[Frame {i+1}] {caption.strip()}")
+
+        except Exception as e:
+            logger.error(f"Model inference error: {e}")
+            raise
+
+        # Create a single merged caption describing the sequence
+        if len(frame_descriptions) == 1:
+            # For static content with single frame, just return the description
+            merged = frame_descriptions[0].replace("[Frame 1] ", "")
+        else:
+            # For multiple frames, create a narrative describing the progression
+            merged = "Sequence showing: " + " → ".join([desc.replace(f"[Frame {i+1}] ", "") for i, desc in enumerate(frame_descriptions)])
+
+        # Minimal postprocessing: ensure no surrounding quotes
+        return merged.strip().strip('"').strip("'")
+
+
+class BlipGenerator(BaseCaptionGenerator):
+    """BLIP image captioning generator.
+
+    Uses Salesforce BLIP model for better caption quality.
+    """
+
+    def __init__(self, model_id: str, cache_dir: str, device: Optional[str] = None):
+        super().__init__(model_id, cache_dir)
+        if device is None:
+            self.device = get_optimal_device()
+        else:
+            self.device = device
+        self.model = None
+        self.processor = None
+        # Register cleanup on exit
+        atexit.register(self.cleanup)
+
+    def cleanup(self):
+        """Explicitly free VRAM by deleting model and clearing cache."""
+        if self.model is not None:
+            logger.info("Cleaning up BLIP model from VRAM...")
+            del self.model
+            self.model = None
+        if self.processor is not None:
+            del self.processor
+            self.processor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def load_model(self):
+        if self.model is not None:
+            return
+
+        logger.info(f"Loading BLIP model: {self.model_id} (device={self.device})...")
+        try:
+            self.processor = BlipProcessor.from_pretrained(
+                self.model_id,
+                cache_dir=self.cache_dir,
+            )
+
+            self.model = BlipForConditionalGeneration.from_pretrained(
+                self.model_id,
+                cache_dir=self.cache_dir,
+            ).to(self.device)
+
+            self.model.eval()
+
+        except Exception as e:
+            logger.error(f"Failed to load BLIP model {self.model_id}: {e}")
+            raise
+
+        logger.info("✓ BLIP model loaded")
+
+    def generate_caption(self, frames: list[Image.Image]) -> str:
+        self.load_model()
+
+        if not frames:
+            return "weißes Bild mit Text"
+
+        try:
+            frame_descriptions = []
+            for i, frame in enumerate(frames):
+                inputs = self.processor(frame, return_tensors="pt").to(self.device)
+
+                with torch.no_grad():
+                    output_ids = self.model.generate(**inputs, max_length=50)
+
+                caption = self.processor.decode(output_ids[0], skip_special_tokens=True)
+                frame_descriptions.append(f"[Frame {i+1}] {caption.strip()}")
+
+        except Exception as e:
+            logger.error(f"BLIP inference error: {e}")
+            raise
+
+        # Create a single merged caption describing the sequence
+        if len(frame_descriptions) == 1:
+            merged = frame_descriptions[0].replace("[Frame 1] ", "")
+        else:
+            merged = "Sequence showing: " + " → ".join([desc.replace(f"[Frame {i+1}] ", "") for i, desc in enumerate(frame_descriptions)])
+
+        return merged.strip().strip('"').strip("'")
+
+
+class Blip2Generator(BaseCaptionGenerator):
+    """BLIP-2 image captioning generator.
+
+    Uses Salesforce BLIP-2 model for strongest caption quality.
+    """
+
+    def __init__(self, model_id: str, cache_dir: str, device: Optional[str] = None):
+        super().__init__(model_id, cache_dir)
+        if device is None:
+            self.device = get_optimal_device()
+        else:
+            self.device = device
+        self.model = None
+        self.processor = None
+        # Register cleanup on exit
+        atexit.register(self.cleanup)
+
+    def cleanup(self):
+        """Explicitly free VRAM by deleting model and clearing cache."""
+        if self.model is not None:
+            logger.info("Cleaning up BLIP-2 model from VRAM...")
+            del self.model
+            self.model = None
+        if self.processor is not None:
+            del self.processor
+            self.processor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def load_model(self):
+        if self.model is not None:
+            return
+
+        logger.info(f"Loading BLIP-2 model: {self.model_id} (device={self.device})...")
+        try:
+            self.processor = Blip2Processor.from_pretrained(
+                self.model_id,
+                cache_dir=self.cache_dir,
+            )
+
+            self.model = Blip2ForConditionalGeneration.from_pretrained(
+                self.model_id,
+                cache_dir=self.cache_dir,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            ).to(self.device)
+
+            self.model.eval()
+
+        except Exception as e:
+            logger.error(f"Failed to load BLIP-2 model {self.model_id}: {e}")
+            raise
+
+        logger.info("✓ BLIP-2 model loaded")
+
+    def generate_caption(self, frames: list[Image.Image]) -> str:
+        self.load_model()
+
+        if not frames:
+            return "weißes Bild mit Text"
+
+        try:
+            frame_descriptions = []
+            for i, frame in enumerate(frames):
+                inputs = self.processor(frame, return_tensors="pt").to(self.device)
+
+                with torch.no_grad():
+                    output_ids = self.model.generate(**inputs, max_length=50)
+
+                caption = self.processor.decode(output_ids[0], skip_special_tokens=True)
+                frame_descriptions.append(f"[Frame {i+1}] {caption.strip()}")
+
+        except Exception as e:
+            logger.error(f"BLIP-2 inference error: {e}")
+            raise
+
+        # Create a single merged caption describing the sequence
+        if len(frame_descriptions) == 1:
+            merged = frame_descriptions[0].replace("[Frame 1] ", "")
+        else:
+            merged = "Sequence showing: " + " → ".join([desc.replace(f"[Frame {i+1}] ", "") for i, desc in enumerate(frame_descriptions)])
+
+        return merged.strip().strip('"').strip("'")
+
+
+class QwenVLGenerator(BaseCaptionGenerator):
+    """Qwen3-VL vision-language model caption generator.
+
+    Uses Qwen/Qwen3-VL-2B-Instruct for advanced vision-language understanding.
+    """
+
+    def __init__(self, model_id: str, cache_dir: str, device: Optional[str] = None):
+        super().__init__(model_id, cache_dir)
+        if device is None:
+            self.device = get_optimal_device()
+        else:
+            self.device = device
+        self.model = None
+        self.processor = None
+        # Register cleanup on exit
+        atexit.register(self.cleanup)
+
+    def cleanup(self):
+        """Explicitly free VRAM by deleting model and clearing cache."""
+        if self.model is not None:
+            logger.info("Cleaning up Qwen VL model from VRAM...")
+            del self.model
+            self.model = None
+        if self.processor is not None:
+            del self.processor
+            self.processor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def load_model(self):
+        if self.model is not None:
+            return
+
+        logger.info(f"Loading Qwen VL model: {self.model_id} (device={self.device})...")
+        try:
+            # Load processor for image/text processing
+            self.processor = AutoProcessor.from_pretrained(
+                self.model_id,
+                trust_remote_code=True,
+            )
+
+            # Load the Qwen3-VL model using official API
+            # Use SDPA attention for better ROCm stability (flash_attention_2 is experimental on ROCm)
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                self.model_id,
+                dtype=torch.bfloat16,
+                device_map="auto",
+            )
+
+            self.model.eval()
+
+        except Exception as e:
+            logger.error(f"Failed to load Qwen VL model {self.model_id}: {e}")
+            raise
+
+        logger.info("✓ Qwen VL model loaded")
+
+    def generate_caption(self, frames: list[Image.Image]) -> str:
+        """Generate a single comprehensive caption from multiple keyframes.
+
+        Leverages Qwen3-VL's multi-image understanding to synthesize one cohesive
+        caption from all keyframes, focusing on visual changes and temporal progression.
+        Uses the SYSTEM_PROMPT to guide generation toward training-appropriate descriptions.
+        """
+        self.load_model()
+
+        if not frames:
+            return "weißes Bild mit Text"
+
+        inputs = None
+        generated_ids = None
+        generated_ids_trimmed = None
+        message_content = None
+        messages = None
+
+        try:
+            # Build multi-frame message content
+            # Qwen3-VL can process multiple images in a single conversation
+            message_content = []
+
+            # Add all frames to the content
+            for frame in frames:
+                message_content.append({
+                    "type": "image",
+                    "image": frame,
+                })
+
+            # Add comprehensive instruction with SYSTEM_PROMPT
+            # This guides the model to create a single cohesive caption focusing on
+            # visual changes rather than repetitively describing static elements
+            instruction_text = f"{SYSTEM_PROMPT}\n\nAnalysiere die oben gezeigten Bilder. Sie zeigen eine zeitliche Abfolge aus einem Video. Erstelle einen einzelnen, zusammenhängenden Text-to-Video-Prompt, der die visuelle Entwicklung und Veränderungen über die Zeit beschreibt."
+
+            message_content.append({
+                "type": "text",
+                "text": instruction_text,
+            })
+
+            # Prepare messages using official Qwen3-VL format
+            messages = [
+                {
+                    "role": "user",
+                    "content": message_content,
+                }
+            ]
+
+            # Preparation for inference using official API
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+            )
+            inputs = inputs.to(self.model.device)
+
+            # Inference: Generation of the output
+            try:
+                with torch.inference_mode():
+                    generated_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=128,  # Allow longer output for comprehensive caption
+                        do_sample=False,  # Disable sampling for stability
+                    )
+            except RuntimeError as e:
+                if "hardware exception" in str(e).lower() or "hsa_status" in str(e).lower():
+                    logger.error(f"GPU hardware exception during generation: {e}")
+                    logger.error("This may be due to ROCm/dtype incompatibility. Try restarting.")
+                    raise
+                raise
+
+            # Trim the input tokens from output
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+
+            # Decode output
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False
+            )
+
+            caption = output_text[0].strip() if output_text else ""
+            return caption.strip().strip('"').strip("'")
+
+        except Exception as e:
+            logger.error(f"Qwen VL inference error: {e}")
+            raise
+        finally:
+            # Ensure per-caption tensors are released promptly
+            if inputs is not None:
+                del inputs
+            if generated_ids is not None:
+                del generated_ids
+            if generated_ids_trimmed is not None:
+                del generated_ids_trimmed
+            if message_content is not None:
+                del message_content
+            if messages is not None:
+                del messages
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def cleanup_step(self):
+        """Extra cleanup after each caption to avoid VRAM accumulation."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
+
+
+def get_caption_generator(backend_key: Optional[str], model_id: str, cache_dir: str):
+    """Factory returning an appropriate caption generator instance.
+
+    backend_key can be one of the keys in CAPTION_MODELS ("vit-gpt2", "blip", "blip2", "qwen3-vl").
+    If backend_key is None or not recognized, default to VitGpt2Generator.
+    """
+    key = (backend_key or "").lower()
+
+    # Resolve common alias where model_id was supplied as a backend key
+    if model_id in CAPTION_MODELS and not key:
+        key = model_id
+
+    # Choose generator based on backend
+    if key == "blip":
+        return BlipGenerator(model_id=model_id, cache_dir=cache_dir)
+    elif key == "blip2":
+        return Blip2Generator(model_id=model_id, cache_dir=cache_dir)
+    elif key == "qwen3-vl":
+        return QwenVLGenerator(model_id=model_id, cache_dir=cache_dir)
+    else:
+        # Default: VitGpt2
+        return VitGpt2Generator(model_id=model_id or CAPTION_MODELS.get("vit-gpt2"), cache_dir=cache_dir)
 
 
 def generate_captions_pipeline(
     metadata_path: Path | str,
     clips_dir: Path | str,
-    model_id: str = "meta-llama/Llama-3.2-11B-Vision-Instruct",
-    cache_dir: str = "/content/drive/MyDrive/Genesis/models/llama",
-    max_frames: int = 8,
+    model_id: Optional[str] = None,
+    cache_dir: str = "/content/drive/MyDrive/Genesis/models/captions",
+    max_frames: int = CAPTION_MAX_FRAMES,
+    backend: Optional[str] = None,
 ) -> Generator[Dict[str, Any], None, None]:
     """
     Generate captions for all clips with progress updates.
 
-    Yields:
-        Progress updates with format:
-        {"status": "loading", "message": "Loading model..."}
-        {"status": "processing", "clip": filename, "caption": str, "progress": (current, total)}
-        {"status": "complete", "total_clips": int}
-        {"status": "error", "message": str}
+    model_id may be either a backend key (e.g. 'vit-gpt2') or a full Hugging Face model id.
+    If neither model_id nor backend are provided, the default configured backend is used.
     """
     metadata_path = Path(metadata_path)
     clips_dir = Path(clips_dir)
@@ -146,10 +781,25 @@ def generate_captions_pipeline(
         yield {"status": "error", "message": "No clips found in metadata"}
         return
 
-    yield {"status": "loading", "message": f"Loading caption model ({model_id})..."}
+    # Resolve backend and model id
+    resolved_backend = backend or CAPTION_BACKEND
+    resolved_model_id = None
+
+    # If model_id provided and matches a backend key, treat it as backend
+    if model_id and model_id in CAPTION_MODELS:
+        resolved_backend = model_id
+        resolved_model_id = CAPTION_MODELS[model_id]
+    elif model_id and ("/" in model_id or model_id.startswith("hf/")):
+        # model_id looks like a HF model id
+        resolved_model_id = model_id
+    else:
+        # Use mapping from backend key
+        resolved_model_id = CAPTION_MODELS.get(resolved_backend, CAPTION_MODELS.get("vit-gpt2"))
+
+    yield {"status": "loading", "message": f"Loading caption backend ({resolved_backend}) -> {resolved_model_id}..."}
 
     # Initialize generator
-    generator = CaptionGenerator(model_id, cache_dir)
+    generator = get_caption_generator(resolved_backend, resolved_model_id, cache_dir)
 
     try:
         generator.load_model()
@@ -157,62 +807,144 @@ def generate_captions_pipeline(
         yield {"status": "error", "message": f"Failed to load model: {str(e)}"}
         return
 
-    # Process clips
-    for idx, clip in enumerate(clips, 1):
-        video_path = clips_dir / clip["file_name"]
-
-        if not video_path.exists():
-            clip["text"] = "white screen with text"
-            yield {
-                "status": "processing",
-                "clip": clip["file_name"],
-                "caption": clip["text"],
-                "progress": (idx, len(clips)),
-                "message": f"Video not found, using fallback caption"
-            }
-            continue
-
+    # Optional summarizer pipeline (disabled by default)
+    summarizer = None
+    if CAPTION_USE_SUMMARIZER:
         try:
-            frames = generator.video_to_frames(video_path, max_frames)
-            caption = generator.generate_caption(frames)
-            clip["text"] = caption
-
-            yield {
-                "status": "processing",
-                "clip": clip["file_name"],
-                "caption": caption,
-                "progress": (idx, len(clips))
-            }
-
+            summarizer = pipeline("summarization", model=CAPTION_SUMMARIZER_ID, device=(0 if torch.cuda.is_available() else -1), cache_dir=cache_dir)
+            logger.info(f"✓ Summarizer loaded: {CAPTION_SUMMARIZER_ID}")
         except Exception as e:
-            logger.error(f"Error generating caption for {clip['file_name']}: {e}")
-            clip["text"] = "error generating caption"
-            yield {
-                "status": "processing",
-                "clip": clip["file_name"],
-                "caption": clip["text"],
-                "progress": (idx, len(clips)),
-                "message": f"Error: {str(e)}"
-            }
+            logger.error(f"Failed to load summarizer {CAPTION_SUMMARIZER_ID}: {e}")
+            summarizer = None
 
-    # Save updated metadata
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        for clip in clips:
-            f.write(json.dumps(clip, ensure_ascii=False) + "\n")
+    # Initialize Whisper model for audio transcription
+    whisper_model = None
+    try:
+        whisper_model = pipeline(
+            "automatic-speech-recognition",
+            model="openai/whisper-base",
+            device=(0 if torch.cuda.is_available() else -1),
+            cache_dir=cache_dir,
+        )
+        logger.info("✓ Whisper model loaded")
+    except Exception as e:
+        logger.warning(f"Failed to load Whisper model: {e}")
+        whisper_model = None
 
-    logger.info(f"Finished! {len(clips)} clips now have captions.")
-    yield {"status": "complete", "total_clips": len(clips)}
+    # Process clips with cleanup guarantee
+    try:
+        # Process clips
+        for idx, clip in enumerate(clips, 1):
+            video_path = clips_dir / clip["file_name"]
+
+            if not video_path.exists():
+                clip["text"] = "white screen with text"
+                clip["audio_text"] = ""
+                yield {
+                    "status": "processing",
+                    "clip": clip["file_name"],
+                    "caption": clip["text"],
+                    "progress": (idx, len(clips)),
+                    "message": f"Video not found, using fallback caption"
+                }
+                continue
+
+            try:
+                # Extract audio and transcribe if Whisper is available
+                audio_text = ""
+                if whisper_model is not None:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
+                        wav_path = wav_file.name
+
+                    try:
+                        if extract_audio_from_video(video_path, wav_path):
+                            audio_text = transcribe_audio_whisper(wav_path, whisper_model)
+                            logger.info(f"Audio transcribed: {clip['file_name'][:50]}... -> {audio_text[:80] if audio_text else '(empty)'}")
+                        else:
+                            logger.warning(f"Failed to extract audio from {clip['file_name']}")
+                    finally:
+                        # Clean up temporary wav file
+                        try:
+                            Path(wav_path).unlink()
+                        except:
+                            pass
+
+                # Generate visual caption
+                frames = generator.video_to_frames(video_path, max_frames)
+                per_frame_caption = generator.generate_caption(frames)
+
+                # If summarizer available/enabled, run it to make a concise German prompt
+                final_caption = per_frame_caption
+                if summarizer is not None and per_frame_caption:
+                    try:
+                        # small safety: bound input length
+                        input_text = per_frame_caption
+                        summary = summarizer(input_text, max_length=160, min_length=40, do_sample=False)
+                        if isinstance(summary, list) and len(summary) > 0:
+                            final_caption = summary[0].get("summary_text", final_caption)
+                    except Exception as e:
+                        logger.error(f"Summarizer error for {clip['file_name']}: {e}")
+
+                clip["text"] = final_caption
+                clip["audio_text"] = audio_text
+
+                yield {
+                    "status": "processing",
+                    "clip": clip["file_name"],
+                    "caption": final_caption,
+                    "audio_text": audio_text,
+                    "progress": (idx, len(clips))
+                }
+
+            except Exception as e:
+                logger.error(f"Error generating caption for {clip['file_name']}: {e}")
+                clip["text"] = "error generating caption"
+                clip["audio_text"] = ""
+                yield {
+                    "status": "processing",
+                    "clip": clip["file_name"],
+                    "caption": clip["text"],
+                    "progress": (idx, len(clips)),
+                    "message": f"Error: {str(e)}"
+                }
+            finally:
+                # Per-caption cleanup to avoid VRAM accumulation
+                if hasattr(generator, "cleanup_step"):
+                    generator.cleanup_step()
+
+        # Save updated metadata
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            for clip in clips:
+                f.write(json.dumps(clip, ensure_ascii=False) + "\n")
+
+        logger.info(f"Finished! {len(clips)} clips now have captions.")
+        yield {"status": "complete", "total_clips": len(clips)}
+
+    finally:
+        # Ensure cleanup happens even on early termination (Ctrl+C, exception, etc.)
+        if hasattr(generator, 'cleanup'):
+            generator.cleanup()
+        elif hasattr(generator, 'model') and generator.model is not None:
+            logger.info("Cleaning up model from VRAM...")
+            del generator.model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 # Legacy main for backward compatibility
 def main():
-    from src.core.config import METADATA_FILE, CUT_VIDEOS_DIR, CAPTION_MODEL_ID, CACHE_DIR
+    from src.core.config import METADATA_FILE, CUT_VIDEOS_DIR, CAPTION_BACKEND, CAPTION_MODELS, CACHE_DIR
+
+    # Resolve default model id from backend mapping
+    backend = CAPTION_BACKEND
+    model_id = CAPTION_MODELS.get(backend, CAPTION_MODELS.get("vit-gpt2"))
 
     for update in generate_captions_pipeline(
         METADATA_FILE,
         CUT_VIDEOS_DIR,
-        model_id=CAPTION_MODEL_ID,
-        cache_dir=CACHE_DIR + "/llama"
+        model_id=model_id,
+        cache_dir=str(CACHE_DIR) + "/captions",
+        backend=backend,
     ):
         if update["status"] == "error":
             logger.error(update["message"])

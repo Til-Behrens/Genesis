@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import yaml
 import logging
+from typing import Tuple
 
 logger = logging.getLogger("Config")
 
@@ -14,7 +15,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 # Model cache directory (can be overridden by env var)
 CACHE_DIR = os.getenv(
     "GENESIS_CACHE_DIR",
-    "/content/drive/MyDrive/Genesis/models"
+    str(PROJECT_ROOT / "cache" / "models")
 )
 
 # Dataset paths
@@ -29,14 +30,40 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 LOGS_DIR = OUTPUTS_DIR / "logs"
 LORA_CHECKPOINTS_DIR = PROJECT_ROOT / "models" / "lora_checkpoints"
 
-# Model IDs
+# Model IDs (Wan models)
 WAN_MODEL_MAP = {
     "14B": "Wan-AI/Wan2.2-T2V-A14B",
     "5B": "Wan-AI/Wan2.2-TI2V-5B",
     "1.3B": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
 }
 
-CAPTION_MODEL_ID = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+# Captioning configuration
+# Backends:
+# - 'vit-gpt2': Lightweight, low VRAM, single-frame only
+# - 'blip': Better accuracy, single-frame only
+# - 'blip2': Stronger model, higher VRAM, single-frame only
+# - 'qwen3-vl': Advanced multi-frame understanding, best quality for sequential video analysis
+CAPTION_BACKEND = os.getenv("GENESIS_CAPTION_BACKEND", "qwen3-vl")
+
+# Mapping of backend keys to Hugging Face model IDs
+CAPTION_MODELS = {
+    "vit-gpt2": "nlpconnect/vit-gpt2-image-captioning",
+    "blip": "Salesforce/blip-image-captioning-base",
+    "blip2": "Salesforce/blip2-opt-2.7b",
+    "qwen3-vl": "Qwen/Qwen3-VL-2B-Instruct",
+}
+
+# Optional summarizer (disabled by default). If enabled, this will be run on the
+# per-frame captions to produce a single concise German prompt.
+CAPTION_USE_SUMMARIZER = False
+CAPTION_SUMMARIZER_ID = "google/mt5-small"
+
+# How many frames to sample per clip when generating captions
+CAPTION_MAX_FRAMES = 6
+
+# Quantization / offload hooks (reserved for advanced users; disabled by default)
+CAPTION_QUANTIZE = False
+CAPTION_OFFLOAD = False
 
 # Training defaults
 DEFAULT_TRAINING_CONFIG = {
@@ -61,6 +88,57 @@ VIDEO_CONFIG = {
 }
 
 
+def get_optimal_device() -> str:
+    """Get the best available compute device.
+
+    Returns:
+        Device string: "cuda" for both NVIDIA and AMD GPUs, "cpu" otherwise.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        else:
+            return "cpu"
+    except ImportError:
+        return "cpu"
+
+
+def get_device_info() -> Tuple[str, str, float]:
+    """Get detailed information about the compute device.
+
+    Returns:
+        Tuple of (device_type, device_name, vram_gb):
+        - device_type: "cuda" or "cpu"
+        - device_name: GPU name with platform (e.g., "AMD Radeon RX 9060 XT (ROCm)")
+        - vram_gb: Total VRAM in GB (0.0 for CPU)
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return ("cpu", "CPU", 0.0)
+
+        device_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+
+        # Detect if we're running on ROCm (AMD) or CUDA (NVIDIA)
+        platform = "CUDA"
+        if hasattr(torch.version, "hip") and torch.version.hip is not None:
+            platform = "ROCm"
+
+        # Format device name with platform info
+        if platform == "ROCm":
+            full_name = f"{device_name} ({platform})"
+        else:
+            full_name = f"{device_name} (CUDA)"
+
+        return ("cuda", full_name, vram_gb)
+
+    except ImportError:
+        return ("cpu", "CPU", 0.0)
+
+
 def ensure_directories():
     """Create all necessary directories."""
     dirs = [
@@ -70,6 +148,7 @@ def ensure_directories():
         OUTPUTS_DIR,
         LOGS_DIR,
         LORA_CHECKPOINTS_DIR,
+        Path(CACHE_DIR),  # Ensure cache directory exists
     ]
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)

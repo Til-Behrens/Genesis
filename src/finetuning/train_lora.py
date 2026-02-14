@@ -13,6 +13,10 @@ from src.finetuning.preprocess_dataset import LatentDataset
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LoRA")
 
+# Suppress verbose logging from dependencies
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 class ProgressCallback(TrainerCallback):
     """Callback to track training progress."""
@@ -73,20 +77,24 @@ def train_lora_pipeline(
         {"status": "error", "message": str}
     """
 
-    # CUDA availability check
-    if not torch.cuda.is_available():
-        yield {"status": "error", "message": "CUDA is not available. A CUDA GPU is required for training."}
+    # GPU availability check
+    from src.core.config import get_device_info, get_optimal_device
+
+    device = get_optimal_device()
+    if device == "cpu":
+        yield {"status": "error", "message": "GPU is not available. A GPU is required for training."}
         return
 
     # Detect precision support
     use_bf16 = torch.cuda.is_bf16_supported()
     torch_dtype = torch.bfloat16 if use_bf16 else torch.float16
 
+    device_type, device_name, vram_gb = get_device_info()
     yield {
         "status": "init",
-        "message": f"Initializing training on {torch.cuda.get_device_name(0)}",
+        "message": f"Initializing training on {device_name}",
         "precision": "bf16" if use_bf16 else "fp16",
-        "device": torch.cuda.get_device_name(0)
+        "device": device_name
     }
 
     output_dir = pathlib.Path(output_dir)

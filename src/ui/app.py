@@ -13,8 +13,8 @@ from src.core.job_manager import job_manager
 from src.core.config import (
     RAW_VIDEOS_DIR, CUT_VIDEOS_DIR, METADATA_FILE,
     PREPROCESSED_LATENTS_DIR, LORA_CHECKPOINTS_DIR,
-    CACHE_DIR, CAPTION_MODEL_ID, DEFAULT_TRAINING_CONFIG,
-    VIDEO_CONFIG
+    CACHE_DIR, CAPTION_MODELS, CAPTION_BACKEND,
+    DEFAULT_TRAINING_CONFIG, VIDEO_CONFIG
 )
 from src.finetuning.cut_videos import cut_videos_pipeline, check_ffmpeg_available
 from src.finetuning.create_captions import generate_captions_pipeline
@@ -26,6 +26,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("GenesisUI")
+
+# Suppress verbose logging from dependencies
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # ============================================================================
@@ -100,7 +104,7 @@ def cut_videos_ui(input_dir: str, output_dir: str, clip_length: int, overlap: in
 # FINETUNING TAB - GENERATE CAPTIONS
 # ============================================================================
 
-def generate_captions_ui(clips_dir: str, metadata_path: str, model_id: str):
+def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
     """Generate captions with progress updates."""
     try:
         with job_manager.acquire_gpu("caption_generation", timeout=2.0):
@@ -113,11 +117,15 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, model_id: str):
 
             log_messages = []
 
+            # Resolve model_id from backend key
+            model_id = CAPTION_MODELS.get(backend, CAPTION_MODELS.get("vit-gpt2"))
+
             for update in generate_captions_pipeline(
                 meta_path,
                 clips_path,
                 model_id=model_id,
-                cache_dir=CACHE_DIR + "/llama",
+                cache_dir=str(CACHE_DIR) + "/captions",
+                backend=backend,
             ):
                 if update["status"] == "error":
                     log_messages.append(f"❌ {update['message']}")
@@ -322,16 +330,20 @@ def train_lora_ui(
 
 def get_gpu_status():
     """Get current GPU status."""
+    from src.core.config import get_device_info
+
     status = job_manager.get_status()
+    device_type, device_name, vram_gb = get_device_info()
 
-    if not torch.cuda.is_available():
-        return "❌ CUDA not available"
+    if device_type == "cpu":
+        return "❌ GPU not available"
 
-    gpu_name = torch.cuda.get_device_name(0)
-    vram_total = torch.cuda.get_device_properties(0).total_memory / 1e9
-    vram_used = torch.cuda.memory_allocated(0) / 1e9
+    try:
+        vram_used = torch.cuda.memory_allocated(0) / 1e9
+    except:
+        vram_used = 0.0
 
-    status_text = f"🖥️ {gpu_name} | VRAM: {vram_used:.1f}/{vram_total:.1f} GB"
+    status_text = f"🖥️ {device_name} | VRAM: {vram_used:.1f}/{vram_gb:.1f} GB"
 
     if status["active"]:
         duration = int(status["duration"])
@@ -349,7 +361,7 @@ def get_gpu_status():
 def build_ui():
     """Build the unified Gradio interface."""
 
-    with gr.Blocks(title="Genesis - Video Generation & Finetuning", theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="Genesis - Video Generation & Finetuning") as app:
         gr.Markdown("# 🎬 Genesis - Video Generation & Finetuning Pipeline")
         gr.Markdown("Generate educational videos or fine-tune Wan2.2 on your own tutorial videos")
 
@@ -447,7 +459,7 @@ def build_ui():
                     )
 
                 with gr.Accordion("Step 2: Generate Captions", open=False):
-                    gr.Markdown("Generate descriptive captions for each clip using Llama Vision")
+                    gr.Markdown("Generate descriptive captions for each clip using lightweight image captioning models")
 
                     with gr.Row():
                         caption_clips_dir = gr.Textbox(
@@ -460,9 +472,15 @@ def build_ui():
                         )
 
                     caption_model = gr.Dropdown(
-                        label="Caption Model",
-                        choices=["meta-llama/Llama-3.2-11B-Vision-Instruct", "meta-llama/Llama-3.2-90B-Vision-Instruct"],
-                        value=CAPTION_MODEL_ID
+                        label="Caption Model Backend",
+                        choices=[
+                            ("qwen3-vl (Qwen/Qwen3-VL-2B-Instruct) - Multi-frame, Best Quality ⭐", "qwen3-vl"),
+                            ("vit-gpt2 (nlpconnect/vit-gpt2-image-captioning) - Low VRAM, Fast", "vit-gpt2"),
+                            ("blip (Salesforce/blip-image-captioning-base) - Better Accuracy", "blip"),
+                            ("blip2 (Salesforce/blip2-flan-t5-small) - Strongest Single-frame", "blip2"),
+                        ],
+                        value=CAPTION_BACKEND,
+                        info="qwen3-vl (default) analyzes multiple frames for coherent captions. Others process single frames."
                     )
 
                     caption_button = gr.Button("📝 Generate Captions", variant="primary")
@@ -577,7 +595,8 @@ def main():
         server_name="127.0.0.1",
         server_port=7860,
         share=False,
-        show_error=True
+        show_error=True,
+        theme=gr.themes.Soft()
     )
 
 
