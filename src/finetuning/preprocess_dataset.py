@@ -201,7 +201,11 @@ def preprocess_videos_to_latents(
             with torch.no_grad():
                 # VAE expects [B, C, T, H, W] format with C=3 for RGB
                 # It will internally patchify to 12 channels
-                frames_tensor = frames_tensor.unsqueeze(0).to(device)  # [1, 3, T, H, W]
+                frames_tensor = frames_tensor.unsqueeze(0)  # [1, 3, T, H, W]
+
+                # Move to device and convert to VAE's dtype to prevent dtype mismatch
+                vae_dtype = next(vae.parameters()).dtype
+                frames_tensor = frames_tensor.to(device=device, dtype=vae_dtype)
 
                 latent = vae.encode(frames_tensor).latent_dist.sample()
                 latent = latent.cpu()
