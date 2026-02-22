@@ -179,8 +179,12 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
             # Load VAE
             yield "⏳ Loading VAE for encoding..."
             from diffusers import AutoencoderKLWan
+            from src.core.config import WAN_MODEL_MAP
 
-            model_id = "Wan-AI/Wan2.2-TI2V-5B"
+            # Use the 5B Diffusers variant which has proper VAE subfolder
+            model_id = WAN_MODEL_MAP["5B"]
+
+            # Load VAE from vae subfolder
             vae = AutoencoderKLWan.from_pretrained(
                 model_id,
                 subfolder="vae",
@@ -533,8 +537,8 @@ def build_ui():
                         with gr.Column():
                             train_model_id = gr.Dropdown(
                                 label="Base Model",
-                                choices=["Wan-AI/Wan2.2-TI2V-5B", "Wan-AI/Wan2.2-T2V-A14B"],
-                                value="Wan-AI/Wan2.2-TI2V-5B"
+                                choices=["Wan-AI/Wan2.2-TI2V-5B-Diffusers", "Wan-AI/Wan2.2-T2V-A14B-Diffusers"],
+                                value="Wan-AI/Wan2.2-TI2V-5B-Diffusers"
                             )
                             train_dataset_dir = gr.Textbox(
                                 label="Dataset Directory",

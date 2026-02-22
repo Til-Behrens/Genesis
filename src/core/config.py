@@ -32,8 +32,8 @@ LORA_CHECKPOINTS_DIR = PROJECT_ROOT / "models" / "lora_checkpoints"
 
 # Model IDs (Wan models)
 WAN_MODEL_MAP = {
-    "14B": "Wan-AI/Wan2.2-T2V-A14B",
-    "5B": "Wan-AI/Wan2.2-TI2V-5B",
+    "14B": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "5B": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
     "1.3B": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
 }
 

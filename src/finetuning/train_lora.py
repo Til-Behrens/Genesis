@@ -30,7 +30,7 @@ class ProgressCallback(TrainerCallback):
 
 
 def train_lora_pipeline(
-    model_id: str = "Wan-AI/Wan2.2-TI2V-5B",
+    model_id: str = "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
     dataset_path: pathlib.Path | str = None,
     use_cached_latents: bool = True,
     latents_cache_dir: pathlib.Path | str = None,
@@ -101,7 +101,7 @@ def train_lora_pipeline(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Load VAE
+        # Load VAE first
         yield {"status": "loading", "message": "Loading VAE..."}
         vae = AutoencoderKLWan.from_pretrained(
             model_id,
@@ -110,7 +110,7 @@ def train_lora_pipeline(
             cache_dir=cache_dir
         )
 
-        # Load pipeline
+        # Load pipeline with VAE
         yield {"status": "loading", "message": f"Loading {model_id}..."}
         pipe = WanPipeline.from_pretrained(
             model_id,
@@ -220,7 +220,7 @@ def train_lora_pipeline(
 def main():
     """Run training with default settings."""
     for update in train_lora_pipeline(
-        model_id="Wan-AI/Wan2.2-TI2V-5B",
+        model_id="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         dataset_path="src/finetuning/dataset",
         use_cached_latents=False,  # Set to True after running preprocessing
         output_dir="models/lora_checkpoints/tutorial_style",

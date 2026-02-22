@@ -23,6 +23,7 @@ class GenesisPipeline:
         if device == "cpu":
             logger.warning("⚠️  GPU not available, using CPU (will be slow)")
 
+        # Load VAE separately with float32 for precision
         vae = AutoencoderKLWan.from_pretrained(
             self.model_id,
             subfolder="vae",
@@ -31,6 +32,7 @@ class GenesisPipeline:
             cache_dir=CACHE_DIR,
         )
 
+        # Load pipeline with the VAE
         self.pipe = WanPipeline.from_pretrained(
             self.model_id,
             vae=vae,
