@@ -184,22 +184,27 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
             # Use the 5B Diffusers variant which has proper VAE subfolder
             model_id = WAN_MODEL_MAP["5B"]
 
-            # Load VAE from vae subfolder
+            # Determine device and dtype for optimal performance
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            # Use bfloat16 on GPU for faster encoding, float32 on CPU
+            dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
+
+            # Load VAE from vae subfolder and move to GPU
             vae = AutoencoderKLWan.from_pretrained(
                 model_id,
                 subfolder="vae",
-                torch_dtype=torch.float32,
+                torch_dtype=dtype,
                 cache_dir=CACHE_DIR
-            )
+            ).to(device)
 
-            log_messages = ["✓ VAE loaded"]
+            log_messages = [f"✓ VAE loaded on {device.upper()} ({dtype})"]
 
             for update in preprocess_videos_to_latents(
                 videos_path,
                 meta_path,
                 cache_path,
                 vae,
-                device="cuda" if torch.cuda.is_available() else "cpu",
+                device=device,
                 num_frames=VIDEO_CONFIG["clip_length"] * VIDEO_CONFIG["target_fps"],
                 target_height=VIDEO_CONFIG["target_height"],
                 target_width=VIDEO_CONFIG["target_width"],

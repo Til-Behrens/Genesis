@@ -54,7 +54,7 @@ class GenesisPipeline:
     def generate(self, prompt: str, duration_sec: int = 8, output_path: str | None = None):
         frames = max(24, int(duration_sec * 24))
 
-        height = 720
+        height = 704  # Must be divisible by 32 for VAE
         width = 1280
         guidance_scale = 4.0
         guidance_scale_2 = 3.0

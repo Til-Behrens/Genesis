@@ -52,11 +52,12 @@ class LatentDataset(torch.utils.data.Dataset):
 def video_to_frames_tensor(
     video_path: Path,
     num_frames: int = 192,  # 8 seconds @ 24fps
-    target_height: int = 720,
+    target_height: int = 704,  # Must be divisible by 32 for VAE
     target_width: int = 1280,
 ) -> torch.Tensor:
     """
-    Load video and convert to tensor [num_frames, channels, height, width].
+    Load video and convert to tensor [channels, num_frames, height, width].
+    Output format matches VAE input expectation: [C, T, H, W]
     """
     cap = cv2.VideoCapture(str(video_path))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -83,8 +84,11 @@ def video_to_frames_tensor(
     if len(frames) != num_frames:
         raise ValueError(f"Could not extract {num_frames} frames from {video_path}")
 
-    # Convert to tensor: [num_frames, height, width, channels] -> [num_frames, channels, height, width]
+    # Convert to tensor: [T, H, W, C] -> [C, T, H, W] for VAE input
+    # First: [T, H, W, C] -> [T, C, H, W]
     frames_tensor = torch.from_numpy(np.array(frames)).permute(0, 3, 1, 2)
+    # Then: [T, C, H, W] -> [C, T, H, W]
+    frames_tensor = frames_tensor.permute(1, 0, 2, 3)
     # Normalize to [-1, 1]
     frames_tensor = frames_tensor.float() / 127.5 - 1.0
 
@@ -98,11 +102,21 @@ def preprocess_videos_to_latents(
     vae,
     device: str = "cuda",
     num_frames: int = 192,
-    target_height: int = 720,
+    target_height: int = 704,
     target_width: int = 1280,
 ) -> Generator[Dict[str, Any], None, None]:
     """
     Preprocess all videos to VAE latents and cache them.
+
+    Args:
+        videos_dir: Directory containing video files
+        metadata_path: Path to metadata.jsonl file
+        output_cache_dir: Directory to cache encoded latents
+        vae: VAE model for encoding
+        device: Device to use for encoding ("cuda" or "cpu")
+        num_frames: Number of frames to extract (must be divisible by 4)
+        target_height: Target video height (must be divisible by 32)
+        target_width: Target video width (must be divisible by 32)
 
     Yields:
         Progress updates with format:
@@ -110,6 +124,28 @@ def preprocess_videos_to_latents(
         {"status": "complete", "total_processed": int, "cache_dir": str}
         {"status": "error", "message": str}
     """
+    # Validate dimensions for VAE
+    if target_height % 32 != 0:
+        yield {
+            "status": "error",
+            "message": f"Invalid height {target_height}. Must be divisible by 32. Use 704 or 736 instead of 720."
+        }
+        return
+
+    if target_width % 32 != 0:
+        yield {
+            "status": "error",
+            "message": f"Invalid width {target_width}. Must be divisible by 32. Recommended: 1280, 1024, 640."
+        }
+        return
+
+    if num_frames % 4 != 0:
+        yield {
+            "status": "error",
+            "message": f"Invalid num_frames {num_frames}. Must be divisible by 4. Current: 192 is valid."
+        }
+        return
+
     videos_dir = Path(videos_dir)
     metadata_path = Path(metadata_path)
     output_cache_dir = Path(output_cache_dir)
@@ -163,7 +199,10 @@ def preprocess_videos_to_latents(
 
             # Encode to latent
             with torch.no_grad():
-                frames_tensor = frames_tensor.unsqueeze(0).to(device)  # Add batch dimension
+                # VAE expects [B, C, T, H, W] format with C=3 for RGB
+                # It will internally patchify to 12 channels
+                frames_tensor = frames_tensor.unsqueeze(0).to(device)  # [1, 3, T, H, W]
+
                 latent = vae.encode(frames_tensor).latent_dist.sample()
                 latent = latent.cpu()
 

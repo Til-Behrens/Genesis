@@ -84,7 +84,7 @@ VIDEO_CONFIG = {
     "overlap": 2,  # seconds
     "target_fps": 24,
     "target_width": 1280,
-    "target_height": 720,
+    "target_height": 704,  # Must be divisible by 32 for VAE (patch_size=2, scale_factor=16)
 }
 
 
