@@ -51,39 +51,52 @@ class GenesisPipeline:
         else:
             logger.info("✓ Model loaded on CPU")
 
-    def generate(self, prompt: str, duration_sec: int = 8, output_path: str | None = None):
-        frames = max(24, int(duration_sec * 24))
-
-        height = 704  # Must be divisible by 32 for VAE
-        width = 1280
-        guidance_scale = 4.0
-        guidance_scale_2 = 3.0
-        num_inference_steps = 40
+    def _get_model_params(self) -> dict:
+        """Get model-specific parameters for generation."""
+        params = {
+            "height": 704,
+            "width": 1280,
+            "guidance_scale": 4.0,
+            "num_inference_steps": 40,
+        }
 
         match self.model_size:
             case "14b":
-                guidance_scale = 5.0,
+                params["guidance_scale_2"] = 3.0
             case "5B":
-                height = 704
-                guidance_scale = 5.0,
-                num_inference_steps = 50,
+                params["guidance_scale"] = 5.0
+                params["num_inference_steps"] = 50
             case "1.3b":
-                height = 480,
-                width = 832,
-                guidance_scale = 5.0
+                params["height"] = 480
+                params["width"] = 832
+                params["guidance_scale"] = 5.0
+
+        return params
+
+    def generate(self, prompt: str, duration_sec: int = 8, output_path: str | None = None):
+        fps = 16
+        frames = max(fps, int(duration_sec * fps))
+
+        params = self._get_model_params()
 
         negative_prompt = "blurry, low quality, distorted text, unreadable text"
 
-        video = self.pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_frames=frames,
-            guidance_scale=guidance_scale,
-            guidance_scale_2=guidance_scale_2,
-            num_inference_steps=num_inference_steps,
-        ).frames[0]
+        # Build the pipeline call arguments
+        pipe_kwargs = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "height": params["height"],
+            "width": params["width"],
+            "num_frames": frames,
+            "guidance_scale": params["guidance_scale"],
+            "num_inference_steps": params["num_inference_steps"],
+        }
+
+        # Only add guidance_scale_2 for 14B model
+        if "guidance_scale_2" in params:
+            pipe_kwargs["guidance_scale_2"] = params["guidance_scale_2"]
+
+        video = self.pipe(**pipe_kwargs).frames[0]
 
         if not output_path:
             safe_name = "".join(c if c.isalnum() else "_" for c in prompt[:30])
@@ -91,7 +104,7 @@ class GenesisPipeline:
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         from diffusers.utils import export_to_video
-        export_to_video(video, output_path, fps=24)
+        export_to_video(video, output_path, fps=fps)
         logger.info(f"Video saved → {output_path}")
         return output_path
 
