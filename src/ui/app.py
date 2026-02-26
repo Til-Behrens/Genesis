@@ -14,7 +14,7 @@ from src.core.config import (
     RAW_VIDEOS_DIR, CUT_VIDEOS_DIR, METADATA_FILE,
     PREPROCESSED_LATENTS_DIR, LORA_CHECKPOINTS_DIR,
     CACHE_DIR, CAPTION_MODELS, CAPTION_BACKEND,
-    DEFAULT_TRAINING_CONFIG, VIDEO_CONFIG
+    DEFAULT_TRAINING_CONFIG, VIDEO_CONFIG, WAN_MODEL_MAP
 )
 from src.finetuning.cut_videos import cut_videos_pipeline, check_ffmpeg_available
 from src.finetuning.create_captions import generate_captions_pipeline
@@ -36,13 +36,15 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # GENERATION TAB
 # ============================================================================
 
-def generate_video(prompt: str, duration_seconds: float, model_size: str):
+def generate_video(prompt: str, duration_seconds: float, model_size: str, seed: int = -1):
     """Generate video with job locking."""
     try:
         with job_manager.acquire_gpu("video_generation", timeout=2.0):
             logger.info(f"Generating video: {prompt[:50]}...")
             pipeline = get_genesis_pipeline(model_size)
-            output_path = pipeline.generate(prompt, int(duration_seconds))
+            # Use None for seed if -1 (random), otherwise use the specified seed
+            seed_value = None if seed == -1 else seed
+            output_path = pipeline.generate(prompt, int(duration_seconds), seed=seed_value)
             return output_path, f"✓ Video generated successfully!"
     except RuntimeError as e:
         return None, f"❌ {str(e)}"
@@ -181,7 +183,7 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
             from diffusers import AutoencoderKLWan
             from src.core.config import WAN_MODEL_MAP
 
-            # Use the 5B Diffusers variant which has proper VAE subfolder
+            # Use the 5B model's VAE
             model_id = WAN_MODEL_MAP["5B"]
 
             # Determine device and dtype for optimal performance
@@ -406,7 +408,7 @@ def build_ui():
                     with gr.Column(scale=1):
                         gen_model = gr.Dropdown(
                             label="Model Size",
-                            choices=["5B", "14B", "1.3B"],
+                            choices=["5B", "14B", "14B-2.1", "1.3B"],
                             value="5B"
                         )
                         gen_duration = gr.Slider(
@@ -416,14 +418,28 @@ def build_ui():
                             value=8,
                             step=1
                         )
+                        with gr.Row():
+                            gen_seed = gr.Number(
+                                label="Seed (-1 = random)",
+                                value=-1,
+                                precision=0
+                            )
+                            randomize_seed = gr.Button("🎲", size="sm")
                         gen_button = gr.Button("🎬 Generate Video", variant="primary", size="lg")
 
                 gen_status = gr.Textbox(label="Status", interactive=False)
                 gen_output = gr.Video(label="Generated Video")
 
+                # Randomize seed button
+                def randomize():
+                    import random
+                    return random.randint(0, 2**31 - 1)
+
+                randomize_seed.click(fn=randomize, outputs=gen_seed)
+
                 gen_button.click(
                     fn=generate_video,
-                    inputs=[gen_prompt, gen_duration, gen_model],
+                    inputs=[gen_prompt, gen_duration, gen_model, gen_seed],
                     outputs=[gen_output, gen_status]
                 )
 
@@ -542,8 +558,8 @@ def build_ui():
                         with gr.Column():
                             train_model_id = gr.Dropdown(
                                 label="Base Model",
-                                choices=["Wan-AI/Wan2.2-TI2V-5B-Diffusers", "Wan-AI/Wan2.2-T2V-A14B-Diffusers"],
-                                value="Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+                                choices=list(WAN_MODEL_MAP.values()),
+                                value=WAN_MODEL_MAP["5B"]
                             )
                             train_dataset_dir = gr.Textbox(
                                 label="Dataset Directory",

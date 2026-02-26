@@ -30,9 +30,10 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 LOGS_DIR = OUTPUTS_DIR / "logs"
 LORA_CHECKPOINTS_DIR = PROJECT_ROOT / "models" / "lora_checkpoints"
 
-# Model IDs (Wan models)
+# Model IDs (Wan models - Diffusers versions are the official supported format)
 WAN_MODEL_MAP = {
     "14B": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "14B-2.1": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
     "5B": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
     "1.3B": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
 }
