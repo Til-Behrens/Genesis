@@ -30,7 +30,7 @@ class ProgressCallback(TrainerCallback):
 
 
 def train_lora_pipeline(
-    model_id: str = "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+    model_id: str = "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
     dataset_path: pathlib.Path | str = None,
     use_cached_latents: bool = True,
     latents_cache_dir: pathlib.Path | str = None,
@@ -38,13 +38,14 @@ def train_lora_pipeline(
     cache_dir: str = "/content/drive/MyDrive/Genesis/models",
     epochs: int = 5,
     batch_size: int = 1,
-    grad_accum_steps: int = 4,
+    grad_accum_steps: int = 8,
     learning_rate: float = 1e-4,
     lora_r: int = 64,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
     save_steps: int = 100,
     logging_steps: int = 10,
+    max_train_steps: int = None,
     progress_callback = None,
 ) -> Generator[Dict[str, Any], None, None]:
     """
@@ -66,6 +67,7 @@ def train_lora_pipeline(
         lora_dropout: LoRA dropout
         save_steps: Save checkpoint every N steps
         logging_steps: Log every N steps
+        max_train_steps: Maximum number of training steps (overrides epochs and dataset size)
         progress_callback: Optional callback for progress updates
 
     Yields:
@@ -90,9 +92,19 @@ def train_lora_pipeline(
     torch_dtype = torch.bfloat16 if use_bf16 else torch.float16
 
     device_type, device_name, vram_gb = get_device_info()
+
+    # Adjust settings for A14B model
+    is_14b = "14B" in model_id or "A14B" in model_id
+    if is_14b:
+        batch_size = 1
+        grad_accum_steps = 8
+        lora_alpha = 64
+        if max_train_steps is None and epochs == 5:  # Only set default max_steps if using default epochs
+            max_train_steps = 10000
+
     yield {
         "status": "init",
-        "message": f"Initializing training on {device_name}",
+        "message": f"Initializing training on {device_name} ({'A14B optimized' if is_14b else 'standard'} settings)",
         "precision": "bf16" if use_bf16 else "fp16",
         "device": device_name
     }
@@ -181,6 +193,10 @@ def train_lora_pipeline(
             logging_dir=str(output_dir / "logs"),
             remove_unused_columns=False,
         )
+
+        if max_train_steps is not None:
+            training_args.num_train_epochs = 1
+            training_args.max_steps = max_train_steps
 
         # Create trainer with callback
         callback = ProgressCallback(callback_fn=progress_callback)
