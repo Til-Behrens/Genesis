@@ -45,12 +45,12 @@ def generate_video(prompt: str, duration_seconds: float, model_size: str, seed: 
             # Use None for seed if -1 (random), otherwise use the specified seed
             seed_value = None if seed == -1 else seed
             output_path = pipeline.generate(prompt, int(duration_seconds), seed=seed_value)
-            return output_path, f"✓ Video generated successfully!"
+            return output_path, f"Video generated successfully!"
     except RuntimeError as e:
-        return None, f"❌ {str(e)}"
+        return None, f"{str(e)}"
     except Exception as e:
         logger.error(f"Generation error: {e}", exc_info=True)
-        return None, f"❌ Error: {str(e)}"
+        return None, f"Error: {str(e)}"
 
 
 # ============================================================================
@@ -65,7 +65,7 @@ def cut_videos_ui(input_dir: str, output_dir: str, clip_length: int, overlap: in
             output_path = Path(output_dir) if output_dir else CUT_VIDEOS_DIR
 
             if not input_path.exists():
-                yield f"❌ Input directory not found: {input_path}", ""
+                yield f"Input directory not found: {input_path}", ""
                 return
 
             log_messages = []
@@ -81,25 +81,25 @@ def cut_videos_ui(input_dir: str, output_dir: str, clip_length: int, overlap: in
                 target_fps=VIDEO_CONFIG["target_fps"],
             ):
                 if update["status"] == "error":
-                    log_messages.append(f"❌ {update['message']}")
+                    log_messages.append(f"{update['message']}")
                     yield "\n".join(log_messages), ""
                     return
 
                 elif update["status"] == "processing":
-                    msg = f"📹 {update['video']}: {update['clips_created']} clips created (Total: {update['total_clips']})"
+                    msg = f"{update['video']}: {update['clips_created']} clips created (Total: {update['total_clips']})"
                     log_messages.append(msg)
                     yield "\n".join(log_messages), ""
 
                 elif update["status"] == "complete":
-                    msg = f"✓ Complete! {update['total_clips']} clips created\n📁 Metadata: {update['metadata_path']}"
+                    msg = f"Complete! {update['total_clips']} clips created\n Metadata: {update['metadata_path']}"
                     log_messages.append(msg)
                     yield "\n".join(log_messages), str(output_path)
 
     except RuntimeError as e:
-        yield f"❌ {str(e)}", ""
+        yield f"{str(e)}", ""
     except Exception as e:
         logger.error(f"Cut videos error: {e}", exc_info=True)
-        yield f"❌ Error: {str(e)}", ""
+        yield f"Error: {str(e)}", ""
 
 
 # ============================================================================
@@ -114,7 +114,7 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
             meta_path = Path(metadata_path) if metadata_path else METADATA_FILE
 
             if not meta_path.exists():
-                yield f"❌ Metadata file not found: {meta_path}"
+                yield f"Metadata file not found: {meta_path}"
                 return
 
             log_messages = []
@@ -130,12 +130,12 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
                 backend=backend,
             ):
                 if update["status"] == "error":
-                    log_messages.append(f"❌ {update['message']}")
+                    log_messages.append(f"{update['message']}")
                     yield "\n".join(log_messages)
                     return
 
                 elif update["status"] == "loading":
-                    msg = f"⏳ {update['message']}"
+                    msg = f"{update['message']}"
                     log_messages.append(msg)
                     yield "\n".join(log_messages)
 
@@ -145,7 +145,7 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
                     if "message" in update:
                         msg += f" - {update['message']}"
                     else:
-                        msg += f"\n   → {update['caption'][:100]}..."
+                        msg += f"\n   -> {update['caption'][:100]}..."
                     log_messages.append(msg)
 
                     # Keep only last 20 messages for readability
@@ -155,15 +155,15 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
                     yield "\n".join(log_messages)
 
                 elif update["status"] == "complete":
-                    msg = f"✓ Complete! {update['total_clips']} clips captioned"
+                    msg = f"Complete! {update['total_clips']} clips captioned"
                     log_messages.append(msg)
                     yield "\n".join(log_messages)
 
     except RuntimeError as e:
-        yield f"❌ {str(e)}"
+        yield f"{str(e)}"
     except Exception as e:
         logger.error(f"Caption generation error: {e}", exc_info=True)
-        yield f"❌ Error: {str(e)}"
+        yield f"Error: {str(e)}"
 
 
 # ============================================================================
@@ -179,7 +179,7 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
             cache_path = Path(cache_dir) if cache_dir else PREPROCESSED_LATENTS_DIR
 
             # Load VAE
-            yield "⏳ Loading VAE for encoding..."
+            yield "Loading VAE for encoding..."
             from diffusers import AutoencoderKLWan
             from src.core.config import WAN_MODEL_MAP
 
@@ -199,7 +199,7 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
                 cache_dir=CACHE_DIR
             ).to(device)
 
-            log_messages = [f"✓ VAE loaded on {device.upper()} ({dtype})"]
+            log_messages = [f"VAE loaded on {device.upper()} ({dtype})"]
 
             for update in preprocess_videos_to_latents(
                 videos_path,
@@ -212,7 +212,7 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
                 target_width=VIDEO_CONFIG["target_width"],
             ):
                 if update["status"] == "error":
-                    log_messages.append(f"❌ {update['message']}")
+                    log_messages.append(f"{update['message']}")
                     yield "\n".join(log_messages)
                     return
 
@@ -228,24 +228,24 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
                     yield "\n".join(log_messages)
 
                 elif update["status"] == "complete":
-                    msg = f"✓ Complete! {update['total_processed']} videos preprocessed\n📁 Cache: {update['cache_dir']}"
+                    msg = f"Complete! {update['total_processed']} videos preprocessed\n Cache: {update['cache_dir']}"
                     log_messages.append(msg)
                     yield "\n".join(log_messages)
 
     except RuntimeError as e:
-        yield f"❌ {str(e)}"
+        yield f"{str(e)}"
     except Exception as e:
         logger.error(f"Preprocessing error: {e}", exc_info=True)
-        yield f"❌ Error: {str(e)}"
+        yield f"Error: {str(e)}"
 
 
 def clear_cache_ui():
     """Clear preprocessed latents cache."""
     try:
         count = clear_cache(PREPROCESSED_LATENTS_DIR)
-        return f"✓ Cleared {count} cached files from {PREPROCESSED_LATENTS_DIR}"
+        return f"Cleared {count} cached files from {PREPROCESSED_LATENTS_DIR}"
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return f"Error: {str(e)}"
 
 
 # ============================================================================
@@ -293,17 +293,17 @@ def train_lora_ui(
                 **DEFAULT_TRAINING_CONFIG,
             ):
                 if update["status"] == "error":
-                    log_messages.append(f"❌ {update['message']}")
+                    log_messages.append(f"{update['message']}")
                     yield "\n".join(log_messages), None
                     return
 
                 elif update["status"] == "init":
-                    msg = f"🚀 {update['message']}\n   Precision: {update['precision']} | Device: {update['device']}"
+                    msg = f"{update['message']}\n   Precision: {update['precision']} | Device: {update['device']}"
                     log_messages.append(msg)
                     yield "\n".join(log_messages), None
 
                 elif update["status"] == "loading":
-                    log_messages.append(f"⏳ {update['message']}")
+                    log_messages.append(f"{update['message']}")
                     yield "\n".join(log_messages), None
 
                 elif update["status"] == "training":
@@ -320,19 +320,19 @@ def train_lora_ui(
                     yield "\n".join(log_messages), current_loss
 
                 elif update["status"] == "saving":
-                    log_messages.append(f"💾 {update['message']}")
+                    log_messages.append(f"{update['message']}")
                     yield "\n".join(log_messages), current_loss
 
                 elif update["status"] == "complete":
-                    msg = f"✓ {update['message']}\n📁 LoRA weights: {update['output_dir']}"
+                    msg = f" {update['message']}\nLoRA weights: {update['output_dir']}"
                     log_messages.append(msg)
                     yield "\n".join(log_messages), current_loss
 
     except RuntimeError as e:
-        yield f"❌ {str(e)}", None
+        yield f"{str(e)}", None
     except Exception as e:
         logger.error(f"Training error: {e}", exc_info=True)
-        yield f"❌ Error: {str(e)}\n{traceback.format_exc()}", None
+        yield f"Error: {str(e)}\n{traceback.format_exc()}", None
 
 
 # ============================================================================
@@ -347,20 +347,20 @@ def get_gpu_status():
     device_type, device_name, vram_gb = get_device_info()
 
     if device_type == "cpu":
-        return "❌ GPU not available"
+        return "GPU not available"
 
     try:
         vram_used = torch.cuda.memory_allocated(0) / 1e9
     except:
         vram_used = 0.0
 
-    status_text = f"🖥️ {device_name} | VRAM: {vram_used:.1f}/{vram_gb:.1f} GB"
+    status_text = f"🖥{device_name} | VRAM: {vram_used:.1f}/{vram_gb:.1f} GB"
 
     if status["active"]:
         duration = int(status["duration"])
-        status_text += f"\n🔒 Locked: {status['job_type']} ({duration}s)"
+        status_text += f"\nLocked: {status['job_type']} ({duration}s)"
     else:
-        status_text += "\n✓ Available"
+        status_text += "\nAvailable"
 
     return status_text
 
@@ -373,7 +373,7 @@ def build_ui():
     """Build the unified Gradio interface."""
 
     with gr.Blocks(title="Genesis - Video Generation & Finetuning") as app:
-        gr.Markdown("# 🎬 Genesis - Video Generation & Finetuning Pipeline")
+        gr.Markdown("# Genesis - Video Generation & Finetuning Pipeline")
         gr.Markdown("Generate educational videos or fine-tune Wan2.2 on your own tutorial videos")
 
         # GPU Status
@@ -384,7 +384,7 @@ def build_ui():
                 interactive=False,
                 lines=2
             )
-            refresh_status_btn = gr.Button("🔄 Refresh Status", size="sm")
+            refresh_status_btn = gr.Button("Refresh Status", size="sm")
 
         refresh_status_btn.click(fn=get_gpu_status, outputs=gpu_status)
 
@@ -394,7 +394,7 @@ def build_ui():
             # ================================================================
             # GENERATION TAB
             # ================================================================
-            with gr.Tab("🎥 Video Generation"):
+            with gr.Tab("Video Generation"):
                 gr.Markdown("### Generate tutorial videos from text prompts")
 
                 with gr.Row():
@@ -424,8 +424,8 @@ def build_ui():
                                 value=-1,
                                 precision=0
                             )
-                            randomize_seed = gr.Button("🎲", size="sm")
-                        gen_button = gr.Button("🎬 Generate Video", variant="primary", size="lg")
+                            randomize_seed = gr.Button("Get random seed", size="sm")
+                        gen_button = gr.Button("Generate Video", variant="primary", size="lg")
 
                 gen_status = gr.Textbox(label="Status", interactive=False)
                 gen_output = gr.Video(label="Generated Video")
@@ -446,9 +446,9 @@ def build_ui():
             # ================================================================
             # FINETUNING TAB
             # ================================================================
-            with gr.Tab("🔧 Finetuning Pipeline"):
-                gr.Markdown("### Fine-tune Wan2.2 on your tutorial videos")
-                gr.Markdown("Follow the steps in order: Cut Videos → Generate Captions → Preprocess → Train LoRA")
+            with gr.Tab("Finetuning Pipeline"):
+                gr.Markdown("### Fine-tune Wan2.2 on your videos")
+                gr.Markdown("Follow the steps in order: Cut Videos -> Generate Captions -> Preprocess -> 2 Train LoRA")
 
                 with gr.Accordion("Step 1: Cut Videos", open=True):
                     gr.Markdown("Split long tutorial videos into 8-second training clips")
@@ -470,10 +470,10 @@ def build_ui():
                         cut_overlap = gr.Slider(label="Overlap (seconds)", minimum=0, maximum=4, value=2, step=1)
 
                     # Check ffmpeg on load
-                    ffmpeg_status = "✓ ffmpeg available" if check_ffmpeg_available() else "❌ ffmpeg not found - please install ffmpeg"
+                    ffmpeg_status = "ffmpeg available" if check_ffmpeg_available() else "ffmpeg not found - please install ffmpeg"
                     gr.Markdown(f"**Status:** {ffmpeg_status}")
 
-                    cut_button = gr.Button("✂️ Cut Videos", variant="primary")
+                    cut_button = gr.Button("Cut Videos", variant="primary")
                     cut_log = gr.Textbox(label="Progress Log", lines=10, interactive=False)
                     cut_result_dir = gr.Textbox(label="Output Directory", interactive=False)
 
@@ -499,7 +499,7 @@ def build_ui():
                     caption_model = gr.Dropdown(
                         label="Caption Model Backend",
                         choices=[
-                            ("qwen3-vl (Qwen/Qwen3-VL-2B-Instruct) - Multi-frame, Best Quality ⭐", "qwen3-vl"),
+                            ("qwen3-vl (Qwen/Qwen3-VL-2B-Instruct) - Multi-frame, Best Quality", "qwen3-vl"),
                             ("vit-gpt2 (nlpconnect/vit-gpt2-image-captioning) - Low VRAM, Fast", "vit-gpt2"),
                             ("blip (Salesforce/blip-image-captioning-base) - Better Accuracy", "blip"),
                             ("blip2 (Salesforce/blip2-flan-t5-small) - Strongest Single-frame", "blip2"),
@@ -508,7 +508,7 @@ def build_ui():
                         info="qwen3-vl (default) analyzes multiple frames for coherent captions. Others process single frames."
                     )
 
-                    caption_button = gr.Button("📝 Generate Captions", variant="primary")
+                    caption_button = gr.Button("Generate Captions", variant="primary")
                     caption_log = gr.Textbox(label="Progress Log", lines=15, interactive=False)
 
                     caption_button.click(
@@ -518,7 +518,7 @@ def build_ui():
                     )
 
                 with gr.Accordion("Step 3: Preprocess Dataset (Optional - Recommended)", open=False):
-                    gr.Markdown("Pre-encode videos to VAE latents for **much faster training** (recommended for H200)")
+                    gr.Markdown("Pre-encode videos to VAE latents for much faster training (recommended)")
 
                     with gr.Row():
                         prep_videos_dir = gr.Textbox(
@@ -535,8 +535,8 @@ def build_ui():
                         )
 
                     with gr.Row():
-                        prep_button = gr.Button("⚡ Preprocess Videos", variant="primary")
-                        clear_cache_button = gr.Button("🗑️ Clear Cache", variant="secondary")
+                        prep_button = gr.Button("Preprocess Videos", variant="primary")
+                        clear_cache_button = gr.Button("Clear Cache", variant="secondary")
 
                     prep_log = gr.Textbox(label="Progress Log", lines=12, interactive=False)
 
@@ -586,7 +586,7 @@ def build_ui():
                         value=str(LORA_CHECKPOINTS_DIR / "tutorial_style")
                     )
 
-                    train_button = gr.Button("🚀 Start Training", variant="primary", size="lg")
+                    train_button = gr.Button("Start Training", variant="primary", size="lg")
 
                     with gr.Row():
                         train_log = gr.Textbox(label="Training Log", lines=12, interactive=False)
@@ -603,7 +603,7 @@ def build_ui():
                     )
 
         gr.Markdown("---")
-        gr.Markdown("💡 **Tip:** All operations are GPU-locked - only one job can run at a time to prevent resource conflicts on your H200.")
+        gr.Markdown("**Tip:** All operations are GPU-locked - only one job can run at a time to prevent resource conflicts.")
 
     return app
 

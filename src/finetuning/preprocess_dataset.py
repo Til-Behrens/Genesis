@@ -42,6 +42,19 @@ class LatentDataset(torch.utils.data.Dataset):
         # Load cached latent
         latent = torch.load(latent_path, map_location="cpu")
 
+        # Validate shape: should be [B, 16, T, H, W]
+        if latent.ndim != 5:
+            raise ValueError(
+                f"Invalid latent shape from {latent_path.name}: "
+                f"expected 5D [B, 16, T, H, W], got {latent.ndim}D {tuple(latent.shape)}"
+            )
+
+        if latent.shape[1] != 16:
+            raise ValueError(
+                f"Invalid latent channels from {latent_path.name}: "
+                f"expected 16 channels, got {latent.shape[1]}. Full shape: {tuple(latent.shape)}"
+            )
+
         return {
             "latents": latent,
             "text": sample["text"],
@@ -51,8 +64,8 @@ class LatentDataset(torch.utils.data.Dataset):
 
 def video_to_frames_tensor(
     video_path: Path,
-    num_frames: int = 192,  # 8 seconds @ 24fps
-    target_height: int = 704,  # Must be divisible by 32 for VAE
+    num_frames: int = 33,  # Adjusted for Wan: 4n+1 pattern, e.g., 33 for ~1.3s at 24fps
+    target_height: int = 720,  # Divisible by 8 for VAE
     target_width: int = 1280,
 ) -> torch.Tensor:
     """
@@ -101,8 +114,8 @@ def preprocess_videos_to_latents(
     output_cache_dir: Path | str,
     vae,
     device: str = "cuda",
-    num_frames: int = 192,
-    target_height: int = 704,
+    num_frames: int = 33,
+    target_height: int = 720,
     target_width: int = 1280,
 ) -> Generator[Dict[str, Any], None, None]:
     """
@@ -114,9 +127,9 @@ def preprocess_videos_to_latents(
         output_cache_dir: Directory to cache encoded latents
         vae: VAE model for encoding
         device: Device to use for encoding ("cuda" or "cpu")
-        num_frames: Number of frames to extract (must be divisible by 4)
-        target_height: Target video height (must be divisible by 32)
-        target_width: Target video width (must be divisible by 32)
+        num_frames: Number of frames to extract (4n+1 for Wan, e.g., 33)
+        target_height: Target video height (divisible by 8)
+        target_width: Target video width (divisible by 8)
 
     Yields:
         Progress updates with format:
@@ -124,25 +137,18 @@ def preprocess_videos_to_latents(
         {"status": "complete", "total_processed": int, "cache_dir": str}
         {"status": "error", "message": str}
     """
-    # Validate dimensions for VAE
-    if target_height % 32 != 0:
+    # Validate dimensions for VAE (spatial divide by 8, temporal by 4)
+    if target_height % 8 != 0 or target_width % 8 != 0:
         yield {
             "status": "error",
-            "message": f"Invalid height {target_height}. Must be divisible by 32. Use 704 or 736 instead of 720."
+            "message": f"Height/width must be divisible by 8 for VAE. Use 720x1280."
         }
         return
 
-    if target_width % 32 != 0:
+    if (num_frames - 1) % 4 != 0:
         yield {
             "status": "error",
-            "message": f"Invalid width {target_width}. Must be divisible by 32. Recommended: 1280, 1024, 640."
-        }
-        return
-
-    if num_frames % 4 != 0:
-        yield {
-            "status": "error",
-            "message": f"Invalid num_frames {num_frames}. Must be divisible by 4. Current: 192 is valid."
+            "message": f"Num frames must be 4n+1 for Wan VAE temporal compression."
         }
         return
 
@@ -199,18 +205,57 @@ def preprocess_videos_to_latents(
 
             # Encode to latent
             with torch.no_grad():
-                # VAE expects [B, C, T, H, W] format with C=3 for RGB
-                # It will internally patchify to 12 channels
+                # VAE expects [B, C, T, H, W] with B=1, C=3
                 frames_tensor = frames_tensor.unsqueeze(0)  # [1, 3, T, H, W]
 
-                # Move to device and convert to VAE's dtype to prevent dtype mismatch
+                # Move to device and convert to VAE's dtype
                 vae_dtype = next(vae.parameters()).dtype
                 frames_tensor = frames_tensor.to(device=device, dtype=vae_dtype)
 
-                latent = vae.encode(frames_tensor).latent_dist.sample()
+                # DEBUG: Log VAE input shape
+                logger.info(f"VAE Input shape: {frames_tensor.shape}")
+
+                # Get VAE encoder output
+                vae_output = vae.encode(frames_tensor)
+                logger.info(f"VAE encode() output type: {type(vae_output)}")
+                logger.info(f"VAE encode() output: {vae_output}")
+
+                # Extract latent distribution
+                latent_dist = vae_output.latent_dist
+                logger.info(f"latent_dist type: {type(latent_dist)}")
+                logger.info(f"latent_dist.mean shape: {latent_dist.mean.shape}")
+                logger.info(f"latent_dist.logvar shape: {latent_dist.logvar.shape}")
+
+                # Use .mean() instead of .sample() for deterministic, reproducible training
+                # (Official Wan2.2 code uses mean for stable LoRA training)
+                latent = latent_dist.mean
+                logger.info(f"Latent shape (from .mean): {latent.shape}")
+
                 latent = latent.cpu()
 
-            # Save latent
+            # Validate latent shape: should be [B, 16, T_latent, H_latent, W_latent]
+            if latent.ndim != 5:
+                error_msg = f"Invalid latent dimensionality: expected 5D, got {latent.ndim}D with shape {latent.shape}"
+                logger.error(error_msg)
+                yield {
+                    "status": "processing",
+                    "video": sample["file_name"],
+                    "progress": (idx, len(samples)),
+                    "message": f"Error: {error_msg}"
+                }
+                continue
+
+            if latent.shape[1] != 16:
+                error_msg = f"Invalid latent channels: expected 16, got {latent.shape[1]} with shape {latent.shape}"
+                logger.error(error_msg)
+                yield {
+                    "status": "processing",
+                    "video": sample["file_name"],
+                    "progress": (idx, len(samples)),
+                    "message": f"Error: {error_msg}"
+                }
+                continue
+
             torch.save(latent, latent_path)
             processed_count += 1
 
@@ -218,11 +263,11 @@ def preprocess_videos_to_latents(
                 "status": "processing",
                 "video": sample["file_name"],
                 "progress": (idx, len(samples)),
-                "message": f"Encoded and cached (shape: {latent.shape})"
+                "message": f"Encoded and cached | Shape: {list(latent.shape)}"
             }
 
         except Exception as e:
-            logger.error(f"Error processing {video_path}: {e}")
+            logger.error(f"Error processing {video_path}: {e}", exc_info=True)
             yield {
                 "status": "processing",
                 "video": sample["file_name"],

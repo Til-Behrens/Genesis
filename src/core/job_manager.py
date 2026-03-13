@@ -1,6 +1,6 @@
 """
 Job management system to prevent concurrent GPU operations.
-Ensures only one training/generation job runs at a time on the H200.
+Ensures only one training/generation job runs at a time.
 """
 import threading
 import time

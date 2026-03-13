@@ -28,13 +28,12 @@ from src.core.config import (
     CAPTION_MAX_FRAMES,
     CAPTION_USE_SUMMARIZER,
     CAPTION_SUMMARIZER_ID,
-    get_optimal_device,
+    get_optimal_device, CACHE_DIR,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CaptionGen")
 
-# Suppress verbose logging from dependencies
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -65,7 +64,6 @@ Der Prompt muss in deutscher Sprache verfasst werden und die spezifischen Konven
 Die Assistenz soll ausschließlich den fertigen Text-to-Video-Prompt ausgeben ohne jegliche Einleitung, Erklärung, Metakommentare oder abschließende Bemerkungen. Der Prompt beginnt direkt mit der Beschreibung des Videos."""
 
 
-# Audio extraction and transcription utilities
 def extract_audio_from_video(video_path: Path | str, output_wav: Path | str) -> bool:
     """Extract audio from video file to WAV format using ffmpeg.
 
@@ -198,7 +196,7 @@ class BaseCaptionGenerator:
         For dynamic content, returns up to max_frames frames at change points.
 
         This ensures:
-        - Static tutorial videos get ONE caption (not 8 identical ones)
+        - Static tutorial videos get one caption per clip (not e.g. 8 identical ones)
         - Dynamic videos get proper frame sampling showing progression
         """
         cap = cv2.VideoCapture(str(video_path))
@@ -320,18 +318,16 @@ class VitGpt2Generator(BaseCaptionGenerator):
                     image_std=[0.5, 0.5, 0.5],
                 )
 
-            # Load the vision-encoder-decoder model
             self.model = VisionEncoderDecoderModel.from_pretrained(
                 self.model_id,
                 cache_dir=self.cache_dir,
-                local_files_only=True,  # Use cached models without network calls
+                local_files_only=True,
             ).to(self.device)
 
-            # Load tokenizer for decoding
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_id,
                 cache_dir=self.cache_dir,
-                local_files_only=True,  # Use cached models without network calls
+                local_files_only=True,
             )
 
             self.model.eval()
@@ -340,7 +336,7 @@ class VitGpt2Generator(BaseCaptionGenerator):
             logger.error(f"Failed to load model {self.model_id}: {e}")
             raise
 
-        logger.info("✓ Caption model loaded")
+        logger.info("Caption model loaded")
 
     def generate_caption(self, frames: list[Image.Image]) -> str:
         self.load_model()
@@ -439,7 +435,7 @@ class BlipGenerator(BaseCaptionGenerator):
             logger.error(f"Failed to load BLIP model {self.model_id}: {e}")
             raise
 
-        logger.info("✓ BLIP model loaded")
+        logger.info("BLIP model loaded")
 
     def generate_caption(self, frames: list[Image.Image]) -> str:
         self.load_model()
@@ -472,10 +468,7 @@ class BlipGenerator(BaseCaptionGenerator):
 
 
 class Blip2Generator(BaseCaptionGenerator):
-    """BLIP-2 image captioning generator.
-
-    Uses Salesforce BLIP-2 model for strongest caption quality.
-    """
+    """BLIP-2 image captioning generator."""
 
     def __init__(self, model_id: str, cache_dir: str, device: Optional[str] = None):
         super().__init__(model_id, cache_dir)
@@ -524,7 +517,7 @@ class Blip2Generator(BaseCaptionGenerator):
             logger.error(f"Failed to load BLIP-2 model {self.model_id}: {e}")
             raise
 
-        logger.info("✓ BLIP-2 model loaded")
+        logger.info("BLIP-2 model loaded")
 
     def generate_caption(self, frames: list[Image.Image]) -> str:
         self.load_model()
@@ -592,13 +585,11 @@ class QwenVLGenerator(BaseCaptionGenerator):
 
         logger.info(f"Loading Qwen VL model: {self.model_id} (device={self.device})...")
         try:
-            # Load processor for image/text processing
             self.processor = AutoProcessor.from_pretrained(
                 self.model_id,
                 trust_remote_code=True,
             )
 
-            # Load the Qwen3-VL model using official API
             # Use SDPA attention for better ROCm stability (flash_attention_2 is experimental on ROCm)
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_id,
@@ -612,7 +603,7 @@ class QwenVLGenerator(BaseCaptionGenerator):
             logger.error(f"Failed to load Qwen VL model {self.model_id}: {e}")
             raise
 
-        logger.info("✓ Qwen VL model loaded")
+        logger.info("Qwen VL model loaded")
 
     def generate_caption(self, frames: list[Image.Image]) -> str:
         """Generate a single comprehensive caption from multiple keyframes.
@@ -654,7 +645,6 @@ class QwenVLGenerator(BaseCaptionGenerator):
                 "text": instruction_text,
             })
 
-            # Prepare messages using official Qwen3-VL format
             messages = [
                 {
                     "role": "user",
@@ -662,7 +652,6 @@ class QwenVLGenerator(BaseCaptionGenerator):
                 }
             ]
 
-            # Preparation for inference using official API
             inputs = self.processor.apply_chat_template(
                 messages,
                 tokenize=True,
@@ -672,13 +661,12 @@ class QwenVLGenerator(BaseCaptionGenerator):
             )
             inputs = inputs.to(self.model.device)
 
-            # Inference: Generation of the output
             try:
                 with torch.inference_mode():
                     generated_ids = self.model.generate(
                         **inputs,
                         max_new_tokens=128,  # Allow longer output for comprehensive caption
-                        do_sample=False,  # Disable sampling for stability
+                        do_sample=False,
                     )
             except RuntimeError as e:
                 if "hardware exception" in str(e).lower() or "hsa_status" in str(e).lower():
@@ -740,7 +728,6 @@ def get_caption_generator(backend_key: Optional[str], model_id: str, cache_dir: 
     if model_id in CAPTION_MODELS and not key:
         key = model_id
 
-    # Choose generator based on backend
     if key == "blip":
         return BlipGenerator(model_id=model_id, cache_dir=cache_dir)
     elif key == "blip2":
@@ -748,7 +735,6 @@ def get_caption_generator(backend_key: Optional[str], model_id: str, cache_dir: 
     elif key == "qwen3-vl":
         return QwenVLGenerator(model_id=model_id, cache_dir=cache_dir)
     else:
-        # Default: VitGpt2
         return VitGpt2Generator(model_id=model_id or CAPTION_MODELS.get("vit-gpt2"), cache_dir=cache_dir)
 
 
@@ -756,7 +742,7 @@ def generate_captions_pipeline(
     metadata_path: Path | str,
     clips_dir: Path | str,
     model_id: Optional[str] = None,
-    cache_dir: str = "/content/drive/MyDrive/Genesis/models/captions",
+    cache_dir: str = CACHE_DIR,
     max_frames: int = CAPTION_MAX_FRAMES,
     backend: Optional[str] = None,
 ) -> Generator[Dict[str, Any], None, None]:
@@ -812,7 +798,7 @@ def generate_captions_pipeline(
     if CAPTION_USE_SUMMARIZER:
         try:
             summarizer = pipeline("summarization", model=CAPTION_SUMMARIZER_ID, device=(0 if torch.cuda.is_available() else -1), cache_dir=cache_dir)
-            logger.info(f"✓ Summarizer loaded: {CAPTION_SUMMARIZER_ID}")
+            logger.info(f" Summarizer loaded: {CAPTION_SUMMARIZER_ID}")
         except Exception as e:
             logger.error(f"Failed to load summarizer {CAPTION_SUMMARIZER_ID}: {e}")
             summarizer = None
@@ -826,7 +812,7 @@ def generate_captions_pipeline(
             device=(0 if torch.cuda.is_available() else -1),
             cache_dir=cache_dir,
         )
-        logger.info("✓ Whisper model loaded")
+        logger.info("Whisper model loaded")
     except Exception as e:
         logger.warning(f"Failed to load Whisper model: {e}")
         whisper_model = None

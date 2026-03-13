@@ -68,10 +68,8 @@ CAPTION_OFFLOAD = False
 
 # Training defaults
 DEFAULT_TRAINING_CONFIG = {
-    "epochs": 5,
-    "batch_size": 1,
-    "gradient_accumulation_steps": 4,
-    "learning_rate": 1e-4,
+    # Note: epochs, batch_size, and learning_rate are passed explicitly from UI
+    # This dict contains only optional/advanced parameters
     "lora_r": 64,
     "lora_alpha": 32,
     "lora_dropout": 0.05,
@@ -153,7 +151,7 @@ def ensure_directories():
     ]
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
-    logger.info(f"✓ Directories initialized")
+    logger.info(f"Directories initialized")
 
 
 def load_config_yaml() -> dict:

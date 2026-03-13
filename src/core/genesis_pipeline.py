@@ -8,7 +8,6 @@ from src.core.config import CACHE_DIR, WAN_MODEL_MAP, get_optimal_device, get_de
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Genesis")
 
-# Suppress verbose logging from dependencies
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -33,10 +32,10 @@ class GenesisPipeline:
         dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
 
         if device == "cpu":
-            logger.warning("⚠️  GPU not available, using CPU (will be slow)")
+            logger.warning("GPU not available, using CPU (will be slow)")
 
         _log_cuda_memory("before_vae_load")
-        # Load VAE separately with float32 for precision
+
         vae = AutoencoderKLWan.from_pretrained(
             self.model_id,
             subfolder="vae",
@@ -44,10 +43,9 @@ class GenesisPipeline:
             local_files_only=False,
             cache_dir=CACHE_DIR,
         )
-        vae.eval()  # Set VAE to evaluation mode for better quality
+        vae.eval()
         _log_cuda_memory("after_vae_load")
 
-        # Load pipeline with the VAE
         self.pipe = WanPipeline.from_pretrained(
             self.model_id,
             vae=vae,
@@ -63,38 +61,33 @@ class GenesisPipeline:
 
         device_type, device_name, vram_gb = get_device_info()
         if device_type == "cuda":
-            logger.info("✓ Model loaded. GPU: %s | VRAM: %.1f GB | Precision: %s",
+            logger.info("Model loaded. GPU: %s | VRAM: %.1f GB | Precision: %s",
                         device_name,
                         vram_gb,
                         "bf16" if dtype == torch.bfloat16 else "fp16")
         else:
-            logger.info("✓ Model loaded on CPU")
+            logger.info(" Model loaded on CPU")
 
     def _get_model_params(self) -> dict:
         """Get model-specific parameters for generation."""
         params = {
-            "height": 704,
+            "height": 720,
             "width": 1280,
             "guidance_scale": 5.0,
-            "num_inference_steps": 50,
+            "num_inference_steps": 20,
         }
 
         match self.model_size:
             case "14B":
-                params["guidance_scale"] = 5.0
                 params["guidance_scale_2"] = 3.0
-                params["num_inference_steps"] = 50
             case "14B-2.1":
-                params["guidance_scale"] = 5.0
                 params["guidance_scale_2"] = 3.0
-                params["num_inference_steps"] = 50
             case "5B":
-                params["guidance_scale"] = 5.0
+                params["height"] = 704
                 params["num_inference_steps"] = 50
             case "1.3B":
                 params["height"] = 480
                 params["width"] = 832
-                params["guidance_scale"] = 5.0
                 params["num_inference_steps"] = 40
 
         return params
@@ -105,7 +98,6 @@ class GenesisPipeline:
 
         params = self._get_model_params()
 
-        # Better negative prompt for quality
         negative_prompt = "low quality, blurry, distorted, noisy, artifacts, unreadable text, static, still image"
 
         # Create generator for reproducibility and quality
@@ -123,7 +115,7 @@ class GenesisPipeline:
             "guidance_scale": params["guidance_scale"],
             "num_inference_steps": params["num_inference_steps"],
             "generator": generator,
-            "output_type": "np",  # Use numpy output for better quality
+            "output_type": "np",
         }
 
         # Only add guidance_scale_2 for 14B model
@@ -185,7 +177,7 @@ class GenesisPipeline:
             torch.cuda.synchronize()
 
         _log_cuda_memory("after_unload")
-        logger.info("✓ Pipeline unloaded and memory freed")
+        logger.info("Pipeline unloaded and memory freed")
 
 
 # Singleton instance (lazy loaded)
@@ -226,4 +218,4 @@ def unload_genesis_pipeline():
         if _genesis_instance is not None:
             _genesis_instance.unload()
             _genesis_instance = None
-            logger.info("✓ Global pipeline instance cleared")
+            logger.info("Global pipeline instance cleared")

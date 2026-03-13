@@ -27,7 +27,7 @@ def check_python_version():
     """Check if Python version is compatible."""
     version = sys.version_info
     if version.major != 3 or version.minor < 11 or version.minor > 13:
-        print(f"⚠️  Warning: Python 3.11-3.13 recommended, you have {version.major}.{version.minor}")
+        print(f"Warning: Python 3.11-3.13 recommended, you have {version.major}.{version.minor}")
         if version.minor > 13:
             print("   PyTorch does not support Python 3.14+ yet")
             print("   Please use Python 3.12 for this project")
@@ -40,7 +40,7 @@ def check_gpu():
     try:
         import torch
         torch_version = torch.__version__
-        print(f"✓ PyTorch: {torch_version}")
+        print(f"PyTorch: {torch_version}")
 
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
@@ -51,14 +51,14 @@ def check_gpu():
             if hasattr(torch.version, "hip") and torch.version.hip is not None:
                 platform = "ROCm"
 
-            print(f"✓ GPU available ({platform}): {gpu_name} ({vram_gb:.1f} GB)")
+            print(f"GPU available ({platform}): {gpu_name} ({vram_gb:.1f} GB)")
             return True
         else:
-            print("⚠️  GPU not available - GPU acceleration disabled")
+            print("GPU not available - GPU acceleration disabled")
             print("   Training will not be possible without GPU")
             return False
     except ImportError:
-        print("⚠️  PyTorch not installed")
+        print("PyTorch not installed")
         return False
 
 def check_ffmpeg():
@@ -70,12 +70,12 @@ def check_ffmpeg():
             timeout=5
         )
         if result.returncode == 0:
-            print("✓ ffmpeg available")
+            print("ffmpeg available")
             return True
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    print("⚠️  ffmpeg not found - video cutting will not work")
+    print("   ffmpeg not found - video cutting will not work")
     print("   Install: sudo apt install ffmpeg (Ubuntu) or brew install ffmpeg (macOS)")
     return False
 
@@ -97,11 +97,11 @@ def check_dependencies():
             missing.append(package)
 
     if missing:
-        print(f"❌ Missing packages: {', '.join(missing)}")
+        print(f"   Missing packages: {', '.join(missing)}")
         print("   Run: pip install -e .")
         return False
 
-    print("✓ All required packages installed")
+    print("  All required packages installed")
     return True
 
 def main():
@@ -126,7 +126,7 @@ def main():
             sys.exit(1)
 
     print("=" * 60)
-    print("🎬 Genesis - Video Generation & Finetuning Pipeline")
+    print("Genesis - Video Generation & Finetuning Pipeline")
     print("=" * 60)
     print()
 
@@ -141,18 +141,18 @@ def main():
     print()
 
     if not has_deps:
-        print("❌ Cannot start - missing dependencies")
+        print("Cannot start - missing dependencies")
         sys.exit(1)
 
     if not has_gpu:
-        print("⚠️  Running without GPU - generation may be slow")
+        print("Running without GPU - generation may be slow")
         response = input("Continue? (y/n): ")
         if response.lower() != 'y':
             sys.exit(1)
 
     print()
     print("=" * 60)
-    print("🚀 Launching Genesis GUI...")
+    print("Launching Genesis GUI...")
     print("=" * 60)
     print()
     print("GUI will be available at: http://127.0.0.1:7860")
@@ -164,12 +164,16 @@ def main():
         from src.ui.app import main as launch_app
         launch_app()
     except KeyboardInterrupt:
-        print("\n\n✓ Genesis stopped")
+        print("\n\nGenesis stopped")
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\nError: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
     main()
+
+
+
+
