@@ -825,6 +825,7 @@ def generate_captions_pipeline(
 
             if not video_path.exists():
                 clip["text"] = "white screen with text"
+                clip["prompt"] = clip["text"]
                 clip["audio_text"] = ""
                 yield {
                     "status": "processing",
@@ -872,6 +873,7 @@ def generate_captions_pipeline(
                         logger.error(f"Summarizer error for {clip['file_name']}: {e}")
 
                 clip["text"] = final_caption
+                clip["prompt"] = final_caption
                 clip["audio_text"] = audio_text
 
                 yield {
@@ -885,6 +887,7 @@ def generate_captions_pipeline(
             except Exception as e:
                 logger.error(f"Error generating caption for {clip['file_name']}: {e}")
                 clip["text"] = "error generating caption"
+                clip["prompt"] = clip["text"]
                 clip["audio_text"] = ""
                 yield {
                     "status": "processing",
@@ -917,27 +920,4 @@ def generate_captions_pipeline(
                 torch.cuda.empty_cache()
 
 
-# Legacy main for backward compatibility
-def main():
-    from src.core.config import METADATA_FILE, CUT_VIDEOS_DIR, CAPTION_BACKEND, CAPTION_MODELS, CACHE_DIR
-
-    # Resolve default model id from backend mapping
-    backend = CAPTION_BACKEND
-    model_id = CAPTION_MODELS.get(backend, CAPTION_MODELS.get("vit-gpt2"))
-
-    for update in generate_captions_pipeline(
-        METADATA_FILE,
-        CUT_VIDEOS_DIR,
-        model_id=model_id,
-        cache_dir=str(CACHE_DIR) + "/captions",
-        backend=backend,
-    ):
-        if update["status"] == "error":
-            logger.error(update["message"])
-        elif update["status"] == "processing":
-            logger.info(f"[{update['progress'][0]}/{update['progress'][1]}] {update['clip']}: {update['caption']}")
-
-
-if __name__ == "__main__":
-    main()
 

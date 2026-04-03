@@ -124,6 +124,7 @@ def cut_videos_pipeline(
                         "file_name": output_file.name,
                         "original_video": video_file.name,
                         "start_time": start,
+                        "prompt": "",
                         "text": ""
                     })
                     clip_id += 1
@@ -157,20 +158,4 @@ def cut_videos_pipeline(
     }
 
 
-# Legacy main for backward compatibility
-def main():
-    script_dir = Path(__file__).parent
-    input_dir = script_dir / "dataset" / "raw_videos"
-    output_dir = script_dir / "dataset" / "cut_videos"
-    metadata_file = script_dir / "dataset" / "metadata.jsonl"
-
-    for update in cut_videos_pipeline(input_dir, output_dir, metadata_file):
-        if update["status"] == "error":
-            logger.error(update["message"])
-        elif update["status"] == "processing":
-            logger.info(f"{update['video']}: {update['clips_created']} clips created")
-
-
-if __name__ == "__main__":
-    main()
 

@@ -12,13 +12,14 @@ from src.core.genesis_pipeline import get_genesis_pipeline
 from src.core.job_manager import job_manager
 from src.core.config import (
     RAW_VIDEOS_DIR, CUT_VIDEOS_DIR, METADATA_FILE,
-    PREPROCESSED_LATENTS_DIR, LORA_CHECKPOINTS_DIR,
+    LORA_CHECKPOINTS_DIR,
     CACHE_DIR, CAPTION_MODELS, CAPTION_BACKEND,
-    DEFAULT_TRAINING_CONFIG, VIDEO_CONFIG, WAN_MODEL_MAP
+    DEFAULT_TRAINING_CONFIG, VIDEO_CONFIG, WAN_MODEL_MAP,
+    WAN_TRAINING_MODEL_MAP, DIFFSYNTH_ROOT
 )
 from src.finetuning.cut_videos import cut_videos_pipeline, check_ffmpeg_available
 from src.finetuning.create_captions import generate_captions_pipeline
-from src.finetuning.preprocess_dataset import preprocess_videos_to_latents, clear_cache
+from src.finetuning.preprocess_dataset import prepare_diffsynth_dataset
 from src.finetuning.train_lora import train_lora_pipeline
 
 logging.basicConfig(
@@ -119,7 +120,6 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
 
             log_messages = []
 
-            # Resolve model_id from backend key
             model_id = CAPTION_MODELS.get(backend, CAPTION_MODELS.get("vit-gpt2"))
 
             for update in generate_captions_pipeline(
@@ -148,7 +148,6 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
                         msg += f"\n   -> {update['caption'][:100]}..."
                     log_messages.append(msg)
 
-                    # Keep only last 20 messages for readability
                     if len(log_messages) > 20:
                         log_messages = log_messages[-20:]
 
@@ -170,46 +169,20 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
 # FINETUNING TAB - PREPROCESS DATASET
 # ============================================================================
 
-def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
-    """Preprocess videos to VAE latents."""
+def preprocess_dataset_ui(videos_dir: str, metadata_path: str, output_metadata_path: str):
+    """Validate dataset and export DiffSynth-ready metadata."""
     try:
         with job_manager.acquire_gpu("preprocessing", timeout=2.0):
             videos_path = Path(videos_dir) if videos_dir else CUT_VIDEOS_DIR
             meta_path = Path(metadata_path) if metadata_path else METADATA_FILE
-            cache_path = Path(cache_dir) if cache_dir else PREPROCESSED_LATENTS_DIR
+            output_path = Path(output_metadata_path) if output_metadata_path else meta_path.with_name(f"{meta_path.stem}_diffsynth.jsonl")
 
-            # Load VAE
-            yield "Loading VAE for encoding..."
-            from diffusers import AutoencoderKLWan
-            from src.core.config import WAN_MODEL_MAP
+            log_messages = ["Preparing DiffSynth dataset metadata..."]
 
-            # Use the 5B model's VAE
-            model_id = WAN_MODEL_MAP["5B"]
-
-            # Determine device and dtype for optimal performance
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            # Use bfloat16 on GPU for faster encoding, float32 on CPU
-            dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
-
-            # Load VAE from vae subfolder and move to GPU
-            vae = AutoencoderKLWan.from_pretrained(
-                model_id,
-                subfolder="vae",
-                torch_dtype=dtype,
-                cache_dir=CACHE_DIR
-            ).to(device)
-
-            log_messages = [f"VAE loaded on {device.upper()} ({dtype})"]
-
-            for update in preprocess_videos_to_latents(
+            for update in prepare_diffsynth_dataset(
                 videos_path,
                 meta_path,
-                cache_path,
-                vae,
-                device=device,
-                num_frames=VIDEO_CONFIG["clip_length"] * VIDEO_CONFIG["target_fps"],
-                target_height=VIDEO_CONFIG["target_height"],
-                target_width=VIDEO_CONFIG["target_width"],
+                output_path,
             ):
                 if update["status"] == "error":
                     log_messages.append(f"{update['message']}")
@@ -228,7 +201,12 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
                     yield "\n".join(log_messages)
 
                 elif update["status"] == "complete":
-                    msg = f"Complete! {update['total_processed']} videos preprocessed\n Cache: {update['cache_dir']}"
+                    msg = (
+                        f"Complete! {update['total_processed']} records validated"
+                        f"\nMissing videos: {update.get('missing_videos', 0)}"
+                    )
+                    if update.get("diffsynth_metadata_path"):
+                        msg += f"\n DiffSynth metadata: {update['diffsynth_metadata_path']}"
                     log_messages.append(msg)
                     yield "\n".join(log_messages)
 
@@ -239,57 +217,39 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, cache_dir: str):
         yield f"Error: {str(e)}"
 
 
-def clear_cache_ui():
-    """Clear preprocessed latents cache."""
-    try:
-        count = clear_cache(PREPROCESSED_LATENTS_DIR)
-        return f"Cleared {count} cached files from {PREPROCESSED_LATENTS_DIR}"
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-
 # ============================================================================
 # FINETUNING TAB - TRAIN LORA
 # ============================================================================
 
 def train_lora_ui(
     model_id: str,
-    dataset_dir: str,
-    use_cached_latents: bool,
-    latents_dir: str,
+    dataset_base_path: str,
+    dataset_metadata_path: str,
     output_dir: str,
+    diffsynth_root: str,
     epochs: int,
-    batch_size: int,
     grad_accum: int,
     learning_rate: float,
 ):
-    """Train LoRA with progress updates."""
+    """Train LoRA using the DiffSynth backend."""
     try:
         with job_manager.acquire_gpu("lora_training", timeout=2.0):
-            dataset_path = Path(dataset_dir) if dataset_dir else Path("src/finetuning/dataset")
-            latents_path = Path(latents_dir) if latents_dir else PREPROCESSED_LATENTS_DIR
+            dataset_base = Path(dataset_base_path) if dataset_base_path else CUT_VIDEOS_DIR
+            dataset_meta = Path(dataset_metadata_path) if dataset_metadata_path else METADATA_FILE
             output_path = Path(output_dir) if output_dir else LORA_CHECKPOINTS_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            diffsynth_root_path = diffsynth_root.strip() if diffsynth_root else (DIFFSYNTH_ROOT or None)
 
             log_messages = []
-            current_loss = None
-
-            def progress_callback(logs):
-                nonlocal current_loss
-                if "loss" in logs:
-                    current_loss = logs["loss"]
 
             for update in train_lora_pipeline(
                 model_id=model_id,
-                dataset_path=dataset_path,
-                use_cached_latents=use_cached_latents,
-                latents_cache_dir=latents_path if use_cached_latents else None,
+                dataset_base_path=dataset_base,
+                dataset_metadata_path=dataset_meta,
                 output_dir=output_path,
-                cache_dir=CACHE_DIR,
+                diffsynth_root=diffsynth_root_path,
                 epochs=epochs,
-                batch_size=batch_size,
-                grad_accum_steps=grad_accum,
+                gradient_accumulation_steps=grad_accum,
                 learning_rate=learning_rate,
-                progress_callback=progress_callback,
                 **DEFAULT_TRAINING_CONFIG,
             ):
                 if update["status"] == "error":
@@ -298,35 +258,26 @@ def train_lora_ui(
                     return
 
                 elif update["status"] == "init":
-                    msg = f"{update['message']}\n   Precision: {update['precision']} | Device: {update['device']}"
-                    log_messages.append(msg)
-                    yield "\n".join(log_messages), None
-
-                elif update["status"] == "loading":
-                    log_messages.append(f"{update['message']}")
+                    log_messages.append(update.get("message", "Initializing training..."))
+                    if update.get("train_script"):
+                        log_messages.append(f"Train script: {update['train_script']}")
+                    if update.get("command"):
+                        log_messages.append(f"Command: {update['command']}")
                     yield "\n".join(log_messages), None
 
                 elif update["status"] == "training":
-                    if "loss" in update:
-                        msg = f"Step {update['step']}: loss = {update['loss']:.4f}"
-                        log_messages.append(msg)
-
-                        # Keep only last 10 messages
-                        if len(log_messages) > 10:
-                            log_messages = log_messages[-10:]
-                    elif "message" in update:
+                    if "message" in update:
                         log_messages.append(update['message'])
 
-                    yield "\n".join(log_messages), current_loss
+                    if len(log_messages) > 20:
+                        log_messages = log_messages[-20:]
 
-                elif update["status"] == "saving":
-                    log_messages.append(f"{update['message']}")
-                    yield "\n".join(log_messages), current_loss
+                    yield "\n".join(log_messages), None
 
                 elif update["status"] == "complete":
-                    msg = f" {update['message']}\nLoRA weights: {update['output_dir']}"
+                    msg = f"Complete! Model saved to {update.get('output_path', output_path)}"
                     log_messages.append(msg)
-                    yield "\n".join(log_messages), current_loss
+                    yield "\n".join(log_messages), None
 
     except RuntimeError as e:
         yield f"{str(e)}", None
@@ -448,7 +399,7 @@ def build_ui():
             # ================================================================
             with gr.Tab("Finetuning Pipeline"):
                 gr.Markdown("### Fine-tune Wan2.2 on your videos")
-                gr.Markdown("Follow the steps in order: Cut Videos -> Generate Captions -> Preprocess -> 2 Train LoRA")
+                gr.Markdown("Follow the steps in order: Cut Videos -> Generate Captions -> Prepare Metadata -> Train LoRA")
 
                 with gr.Accordion("Step 1: Cut Videos", open=True):
                     gr.Markdown("Split long tutorial videos into 8-second training clips")
@@ -517,8 +468,8 @@ def build_ui():
                         outputs=caption_log
                     )
 
-                with gr.Accordion("Step 3: Preprocess Dataset (Optional - Recommended)", open=False):
-                    gr.Markdown("Pre-encode videos to VAE latents for much faster training (recommended)")
+                with gr.Accordion("Step 3: Prepare DiffSynth Metadata", open=False):
+                    gr.Markdown("Normalize metadata (csv/json/jsonl) into a DiffSynth-ready jsonl file")
 
                     with gr.Row():
                         prep_videos_dir = gr.Textbox(
@@ -529,25 +480,19 @@ def build_ui():
                             label="Metadata File",
                             value=str(METADATA_FILE)
                         )
-                        prep_cache_dir = gr.Textbox(
-                            label="Cache Directory",
-                            value=str(PREPROCESSED_LATENTS_DIR)
+                        prep_output_metadata = gr.Textbox(
+                            label="Output DiffSynth Metadata (.jsonl)",
+                            value=str(METADATA_FILE.with_name(f"{METADATA_FILE.stem}_diffsynth.jsonl"))
                         )
 
                     with gr.Row():
-                        prep_button = gr.Button("Preprocess Videos", variant="primary")
-                        clear_cache_button = gr.Button("Clear Cache", variant="secondary")
+                        prep_button = gr.Button("Prepare Metadata", variant="primary")
 
                     prep_log = gr.Textbox(label="Progress Log", lines=12, interactive=False)
 
                     prep_button.click(
                         fn=preprocess_dataset_ui,
-                        inputs=[prep_videos_dir, prep_metadata, prep_cache_dir],
-                        outputs=prep_log
-                    )
-
-                    clear_cache_button.click(
-                        fn=clear_cache_ui,
+                        inputs=[prep_videos_dir, prep_metadata, prep_output_metadata],
                         outputs=prep_log
                     )
 
@@ -558,26 +503,25 @@ def build_ui():
                         with gr.Column():
                             train_model_id = gr.Dropdown(
                                 label="Base Model",
-                                choices=list(WAN_MODEL_MAP.values()),
-                                value=WAN_MODEL_MAP["5B"]
+                                choices=list(WAN_TRAINING_MODEL_MAP.values()),
+                                value=WAN_TRAINING_MODEL_MAP["1.3B"]
                             )
-                            train_dataset_dir = gr.Textbox(
-                                label="Dataset Directory",
-                                value="src/finetuning/dataset"
+                            train_dataset_base_path = gr.Textbox(
+                                label="Dataset Base Path (video files)",
+                                value=str(CUT_VIDEOS_DIR)
                             )
-                            train_use_cache = gr.Checkbox(
-                                label="Use Cached Latents (faster)",
-                                value=True,
-                                info="Enable if you ran Step 3"
+                            train_dataset_metadata_path = gr.Textbox(
+                                label="Dataset Metadata Path",
+                                value=str(METADATA_FILE)
                             )
-                            train_latents_dir = gr.Textbox(
-                                label="Latents Cache Directory",
-                                value=str(PREPROCESSED_LATENTS_DIR)
+                            train_diffsynth_root = gr.Textbox(
+                                label="DiffSynth Root (optional)",
+                                value=DIFFSYNTH_ROOT,
+                                placeholder="Path containing examples/wanvideo/model_training/train.py"
                             )
 
                         with gr.Column():
                             train_epochs = gr.Slider(label="Epochs", minimum=1, maximum=20, value=5, step=1)
-                            train_batch_size = gr.Slider(label="Batch Size", minimum=1, maximum=4, value=1, step=1)
                             train_grad_accum = gr.Slider(label="Gradient Accumulation", minimum=1, maximum=16, value=4, step=1)
                             train_lr = gr.Number(label="Learning Rate", value=1e-4, precision=6)
 
@@ -595,9 +539,14 @@ def build_ui():
                     train_button.click(
                         fn=train_lora_ui,
                         inputs=[
-                            train_model_id, train_dataset_dir, train_use_cache,
-                            train_latents_dir, train_output_dir, train_epochs,
-                            train_batch_size, train_grad_accum, train_lr
+                            train_model_id,
+                            train_dataset_base_path,
+                            train_dataset_metadata_path,
+                            train_output_dir,
+                            train_diffsynth_root,
+                            train_epochs,
+                            train_grad_accum,
+                            train_lr
                         ],
                         outputs=[train_log, train_loss]
                     )

@@ -23,7 +23,6 @@ DATASET_ROOT = PROJECT_ROOT / "src" / "finetuning" / "dataset"
 RAW_VIDEOS_DIR = DATASET_ROOT / "raw_videos"
 CUT_VIDEOS_DIR = DATASET_ROOT / "cut_videos"
 METADATA_FILE = DATASET_ROOT / "metadata.jsonl"
-PREPROCESSED_LATENTS_DIR = PROJECT_ROOT / "data" / "preprocessed_latents"
 
 # Output paths
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
@@ -37,6 +36,15 @@ WAN_MODEL_MAP = {
     "5B": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
     "1.3B": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
 }
+
+# Model IDs for DiffSynth training backend
+WAN_TRAINING_MODEL_MAP = {
+    "1.3B": "Wan-AI/Wan2.1-T2V-1.3B",
+    "14B-2.1": "Wan-AI/Wan2.1-T2V-14B",
+}
+
+# Optional DiffSynth-Studio root. If empty, training auto-detects from installed package.
+DIFFSYNTH_ROOT = os.getenv("GENESIS_DIFFSYNTH_ROOT", "")
 
 # Captioning configuration
 # Backends:
@@ -68,13 +76,20 @@ CAPTION_OFFLOAD = False
 
 # Training defaults
 DEFAULT_TRAINING_CONFIG = {
-    # Note: epochs, batch_size, and learning_rate are passed explicitly from UI
-    # This dict contains only optional/advanced parameters
-    "lora_r": 64,
-    "lora_alpha": 32,
-    "lora_dropout": 0.05,
+    # Note: epochs and learning_rate are passed explicitly from UI.
+    "dataset_repeat": 100,
+    "dataset_num_workers": 0,
+    "data_file_keys": "file_name",
+    "lora_base_model": "dit",
+    "lora_target_modules": "q,k,v,o,ffn.0,ffn.2",
+    "lora_rank": 32,
+    "remove_prefix_in_ckpt": "pipe.dit.",
+    "gradient_accumulation_steps": 1,
     "save_steps": 100,
-    "logging_steps": 10,
+    "extra_inputs": None,
+    "find_unused_parameters": False,
+    "accelerate_config_file": None,
+    "initialize_model_on_cpu": False,
 }
 
 # Video processing defaults
@@ -143,7 +158,6 @@ def ensure_directories():
     dirs = [
         RAW_VIDEOS_DIR,
         CUT_VIDEOS_DIR,
-        PREPROCESSED_LATENTS_DIR,
         OUTPUTS_DIR,
         LOGS_DIR,
         LORA_CHECKPOINTS_DIR,
