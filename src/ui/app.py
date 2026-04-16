@@ -14,8 +14,7 @@ from src.core.config import (
     RAW_VIDEOS_DIR, CUT_VIDEOS_DIR, METADATA_FILE,
     LORA_CHECKPOINTS_DIR,
     CACHE_DIR, CAPTION_MODELS, CAPTION_BACKEND,
-    DEFAULT_TRAINING_CONFIG, VIDEO_CONFIG, WAN_MODEL_MAP,
-    WAN_TRAINING_MODEL_MAP, DIFFSYNTH_ROOT
+    DEFAULT_TRAINING_CONFIG, VIDEO_CONFIG, WAN_MODEL_MAP, DIFFSYNTH_ROOT
 )
 from src.finetuning.cut_videos import cut_videos_pipeline, check_ffmpeg_available
 from src.finetuning.create_captions import generate_captions_pipeline
@@ -503,8 +502,8 @@ def build_ui():
                         with gr.Column():
                             train_model_id = gr.Dropdown(
                                 label="Base Model",
-                                choices=list(WAN_TRAINING_MODEL_MAP.values()),
-                                value=WAN_TRAINING_MODEL_MAP["1.3B"]
+                                choices=list(WAN_MODEL_MAP.values()),
+                                value=WAN_MODEL_MAP["1.3B"]
                             )
                             train_dataset_base_path = gr.Textbox(
                                 label="Dataset Base Path (video files)",

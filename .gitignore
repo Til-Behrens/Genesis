@@ -43,8 +43,7 @@ env/
 .DS_Store
 
 # Model weights and checkpoints
-models/pretrained/
-models/lora_checkpoints/
+models/
 *.pth
 *.pt
 *.ckpt
@@ -52,7 +51,7 @@ models/lora_checkpoints/
 flash-attention/
 
 # Data directories
-data/preprocessed_latents/
+data/
 src/finetuning/dataset/raw_videos/
 src/finetuning/dataset/cut_videos/
 
@@ -105,8 +104,10 @@ dmypy.json
 *.temp
 tmp/
 temp/
+test.py
 
 # media files
 *.mp4
 *.mp3
 *.wav
+

@@ -29,18 +29,12 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 LOGS_DIR = OUTPUTS_DIR / "logs"
 LORA_CHECKPOINTS_DIR = PROJECT_ROOT / "models" / "lora_checkpoints"
 
-# Model IDs (Wan models - Diffusers versions are the official supported format)
+# Model IDs
 WAN_MODEL_MAP = {
-    "14B": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-    "14B-2.1": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
-    "5B": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-    "1.3B": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-}
-
-# Model IDs for DiffSynth training backend
-WAN_TRAINING_MODEL_MAP = {
-    "1.3B": "Wan-AI/Wan2.1-T2V-1.3B",
+    "14B": "Wan-AI/Wan2.2-T2V-A14B",
     "14B-2.1": "Wan-AI/Wan2.1-T2V-14B",
+    "5B": "Wan-AI/Wan2.2-TI2V-5B",
+    "1.3B": "Wan-AI/Wan2.1-T2V-1.3B",
 }
 
 # Optional DiffSynth-Studio root. If empty, training auto-detects from installed package.
@@ -131,7 +125,7 @@ def get_device_info() -> Tuple[str, str, float]:
         import torch
 
         if not torch.cuda.is_available():
-            return ("cpu", "CPU", 0.0)
+            return "cpu", "CPU", 0.0
 
         device_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -147,10 +141,10 @@ def get_device_info() -> Tuple[str, str, float]:
         else:
             full_name = f"{device_name} (CUDA)"
 
-        return ("cuda", full_name, vram_gb)
+        return "cuda", full_name, vram_gb
 
     except ImportError:
-        return ("cpu", "CPU", 0.0)
+        return "cpu", "CPU", 0.0
 
 
 def ensure_directories():
