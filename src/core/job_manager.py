@@ -47,13 +47,13 @@ class JobLock:
 
         self._active_job = job_type
         self._start_time = time.time()
-        logger.info(f"🔒 GPU locked for: {job_type}")
+        logger.info(f"GPU locked for: {job_type}")
 
         try:
             yield self
         finally:
             duration = time.time() - self._start_time if self._start_time else 0
-            logger.info(f"🔓 GPU released from: {job_type} (duration: {duration:.1f}s)")
+            logger.info(f"GPU released from: {job_type} (duration: {duration:.1f}s)")
             self._active_job = None
             self._start_time = None
             self._lock.release()

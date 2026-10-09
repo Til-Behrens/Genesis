@@ -309,7 +309,7 @@ def get_gpu_status():
     except RuntimeError:
         vram_used = 0.0
 
-    status_text = f"🖥{device_name} | VRAM: {vram_used:.1f}/{vram_gb:.1f} GB"
+    status_text = f"{device_name} | VRAM: {vram_used:.1f}/{vram_gb:.1f} GB"
 
     if status["active"]:
         duration = int(status["duration"])

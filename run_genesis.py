@@ -18,7 +18,7 @@ def check_first_time_setup():
     """Check if first-time setup has been completed."""
     # Allow --force-setup flag to re-run setup
     if "--force-setup" in sys.argv:
-        print("🔄 Forcing setup re-run...\n")
+        print("Forcing setup re-run...\n")
         return False
 
     return SETUP_MARKER.exists()
@@ -84,9 +84,8 @@ def check_dependencies():
     required = [
         "gradio",
         "torch",
-        "diffusers",
+        "diffsynth",
         "transformers",
-        "peft",
     ]
 
     missing = []
@@ -109,7 +108,7 @@ def main():
     # Check if first-time setup has been completed
     if not check_first_time_setup():
         print("=" * 60)
-        print("🎬 Genesis - First Time Setup Required")
+        print("Genesis - First Time Setup Required")
         print("=" * 60)
         print("\nGenesis needs to be set up before first use.")
         print("This will detect your GPU and install the correct PyTorch version.")

@@ -3,6 +3,7 @@
 First-time setup wizard for Genesis.
 Detects hardware, installs correct PyTorch, prepares environment.
 """
+import re
 import sys
 import subprocess
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 SETUP_MARKER = Path.home() / ".genesis_setup_complete"
 
 def print_header(text):
+    """Print a section banner."""
     print("\n" + "=" * 70)
     print(f"{text}")
     print("=" * 70)
@@ -72,27 +74,19 @@ def detect_gpu_hardware():
     amd_gpu = None
     amd_vram = 0
     try:
-        result = subprocess.run(['rocm-smi'], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            # Get detailed GPU info
-            result2 = subprocess.run(
-                ['rocm-smi', '--showproductname'],
-                capture_output=True, text=True, timeout=5
+        names = subprocess.run(
+            ['rocm-smi', '--showproductname'], capture_output=True, text=True, timeout=5
+        )
+        if names.returncode == 0:
+            match = re.search(r"Card Series:\s*(.+)", names.stdout, re.IGNORECASE)
+            amd_gpu = match.group(1).strip() if match else "AMD Radeon GPU"
+
+            mem = subprocess.run(
+                ['rocm-smi', '--showmeminfo', 'vram'], capture_output=True, text=True, timeout=5
             )
-            if result2.returncode == 0:
-                # Check for specific GPU models
-                if '0x7590' in result2.stdout:
-                    amd_gpu = "AMD Radeon RX 9060 XT"
-                    amd_vram = 16.0
-                elif '0x744c' in result2.stdout or '7900' in result2.stdout:
-                    amd_gpu = "AMD Radeon RX 7900 XTX"
-                    amd_vram = 24.0
-                elif '0x73bf' in result2.stdout or '7900 XT' in result2.stdout:
-                    amd_gpu = "AMD Radeon RX 7900 XT"
-                    amd_vram = 20.0
-                else:
-                    amd_gpu = "AMD Radeon GPU"
-                    amd_vram = 8.0  # Default estimate
+            match = re.search(r"Total Memory \(B\):\s*(\d+)", mem.stdout, re.IGNORECASE)
+            # unknown vram counts as low so the wizard warns
+            amd_vram = int(match.group(1)) / 1e9 if match else 0.0
 
             if amd_gpu:
                 print(f"OK: AMD GPU detected: {amd_gpu} ({amd_vram:.1f} GB)")
@@ -275,7 +269,7 @@ def check_vram_warnings(vram_gb):
         print("   - Caption generation may work with small models")
         return False
     elif vram_gb < 16:
-        print("\n️  NOTICE: Less than 16GB VRAM")
+        print("\n  NOTICE: Less than 16GB VRAM")
         print("   - Use 1.3B model for generation (not 5B or 14B)")
         print("   - Training will be slow, use small batch sizes")
         print("   - Caption generation should work fine")

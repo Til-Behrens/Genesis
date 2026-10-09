@@ -51,6 +51,10 @@ def cut_videos_pipeline(
     output_dir = Path(output_dir)
     metadata_path = Path(metadata_path)
 
+    if not 0 <= overlap < clip_length:
+        yield {"status": "error", "message": f"Overlap ({overlap}s) must be smaller than clip length ({clip_length}s)."}
+        return
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Check ffmpeg availability
@@ -88,9 +92,7 @@ def cut_videos_pipeline(
                 logger.warning(f"Too short: {video_file} ({duration}s) – skip.")
                 continue
 
-            # Calculate clips
             step = clip_length - overlap
-            num_clips = max(1, int((duration - clip_length) / step) + 1)
 
             clips_from_this_video = 0
             for start in range(0, int(duration) - clip_length + 1, step):
