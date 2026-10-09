@@ -1,28 +1,52 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "genesis"
-version = "0.1.0"
-
+version = "0.2.0"
+description = "Text-to-video generation and LoRA fine-tuning for university tutorial videos"
+readme = "README.md"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "Til Behrens" }]
+requires-python = ">=3.11,<3.14"
+# torch, torchvision and torchaudio come from setup_genesis.py, which picks the CUDA or ROCm build
 dependencies = [
-    "gradio",
-    # torch, torchvision, torchaudio installed by setup_genesis.py
-    "diffusers",
+    "diffsynth>=2.1",
+    "gradio>=6",
+    "transformers>=4.57",
     "accelerate",
-    "transformers",
-    "ftfy",
-    "imageio",
-    "imageio-ffmpeg",
-    "peft",
-    "datasets",
-    "tqdm",
+    "numpy",
     "opencv-python",
     "pillow",
-    "pyyaml",
-    "openai-whisper",
-    "qwen-vl-utils",
-    "diffsynth"
 ]
 
-#[build-system]
-#requires = ["hatchling"]
-#build-backend = "hatchling.build"
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
 
+[project.scripts]
+genesis = "genesis.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP", "D"]
+ignore = ["D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+"src/genesis/__main__.py" = ["D"]
+"src/genesis/finetuning/captioning/prompts.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

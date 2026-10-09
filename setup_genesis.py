@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""
-First-time setup wizard for Genesis.
-Detects hardware, installs correct PyTorch, prepares environment.
+"""Setup wizard for Genesis: detects the GPU, installs the matching PyTorch build, then Genesis.
+
+Uses only the standard library because it runs before anything is installed; safe to re-run.
 """
 import re
-import sys
 import subprocess
-from pathlib import Path
+import sys
 
-SETUP_MARKER = Path.home() / ".genesis_setup_complete"
 
 def print_header(text):
     """Print a section banner."""
@@ -25,7 +23,7 @@ def check_python_version():
 
     print(f"Python version: {major}.{minor}")
 
-    # PyTorch pre-built wheels are available for Python 3.9-3.13
+    # pytorch wheels exist for 3.9 to 3.13
     if major != 3 or minor < 9:
         print("\nPython 3.9 or newer is required")
         print("  Your version is too old")
@@ -52,7 +50,6 @@ def detect_gpu_hardware():
     """Detect available GPU hardware (NVIDIA or AMD)."""
     print_header("Hardware Detection")
 
-    # Check for NVIDIA GPU
     nvidia_gpu = None
     nvidia_vram = 0
     try:
@@ -65,12 +62,11 @@ def detect_gpu_hardware():
             if line:
                 parts = line.split(',')
                 nvidia_gpu = parts[0].strip()
-                nvidia_vram = float(parts[1].strip().split()[0]) / 1024  # Convert MB to GB
+                nvidia_vram = float(parts[1].strip().split()[0]) / 1024  # mib to gb
                 print(f"NVIDIA GPU detected: {nvidia_gpu} ({nvidia_vram:.1f} GB)")
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
 
-    # Check for AMD GPU
     amd_gpu = None
     amd_vram = 0
     try:
@@ -90,7 +86,7 @@ def detect_gpu_hardware():
 
             if amd_gpu:
                 print(f"OK: AMD GPU detected: {amd_gpu} ({amd_vram:.1f} GB)")
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
 
     if not nvidia_gpu and not amd_gpu:
@@ -98,7 +94,6 @@ def detect_gpu_hardware():
         print("   Genesis will run on CPU (very slow)")
         return None
 
-    # Return the detected GPU
     if nvidia_gpu and amd_gpu:
         print("\n  Both NVIDIA and AMD GPUs detected!")
         print("   Using NVIDIA by default")
@@ -122,8 +117,8 @@ def check_pytorch_installation(gpu_type):
         print(f"  Built with CUDA: {cuda_version if cuda_version else 'No'}")
         print(f"  Built with ROCm: {hip_version if hip_version else 'No'}")
 
-        # Check PyTorch version (need 2.6+ for torch.load security fix CVE-2025-32434)
-        version_parts = version.split('+')[0].split('.')  # Remove +rocm/+cu suffix
+        # 2.6+ fixes torch.load (cve-2025-32434)
+        version_parts = version.split('+')[0].split('.')  # strip +rocm/+cu suffix
         major = int(version_parts[0])
         minor = int(version_parts[1]) if len(version_parts) > 1 else 0
 
@@ -133,7 +128,6 @@ def check_pytorch_installation(gpu_type):
             print("   Your current version may have security vulnerabilities")
             return False
 
-        # Check if PyTorch matches GPU
         if gpu_type == "nvidia" and not cuda_version:
             print("\n Wrong PyTorch: You have NVIDIA GPU but PyTorch is not built with CUDA")
             return False
@@ -144,7 +138,6 @@ def check_pytorch_installation(gpu_type):
             print("\n PyTorch has GPU support but no GPU detected")
             return True
 
-        # Test if PyTorch can see the GPU
         if gpu_type and not torch.cuda.is_available():
             print("\n PyTorch cannot detect GPU")
             return False
@@ -162,14 +155,12 @@ def install_pytorch(gpu_type):
 
     print("\nThis may take several minutes...")
 
-    # Uninstall existing PyTorch
     print("\n1. Removing existing PyTorch (if needed)...")
     subprocess.run(
         [sys.executable, '-m', 'pip', 'uninstall', '-y', 'torch', 'torchvision', 'torchaudio', 'triton'],
         capture_output=True
     )
 
-    # Install new PyTorch
     print("2. Installing PyTorch...")
 
     if gpu_type == "nvidia":
@@ -182,7 +173,6 @@ def install_pytorch(gpu_type):
         )
     elif gpu_type == "amd":
         print("Installing PyTorch with ROCm 7.1 support...")
-        # Use PyTorch's official ROCm index (supports multiple distributions and Python versions)
         result = subprocess.run(
             [sys.executable, '-m', 'pip', 'install',
              'torch>=2.6', 'torchvision', 'torchaudio',
@@ -210,7 +200,7 @@ def verify_pytorch_works():
     print_header("Verification")
 
     try:
-        # Force reimport after installation
+        # drop the cached module so the new build is imported
         if 'torch' in sys.modules:
             del sys.modules['torch']
 
@@ -225,7 +215,6 @@ def verify_pytorch_works():
                 vram = torch.cuda.get_device_properties(i).total_memory / 1e9
                 print(f"  GPU {i}: {name} ({vram:.1f} GB)")
 
-            # Detect platform
             platform = "CUDA"
             if hasattr(torch.version, 'hip') and torch.version.hip:
                 platform = "ROCm"
@@ -295,20 +284,18 @@ def run_first_time_setup():
     print("\nThis wizard will:")
     print("  1. Check Python version compatibility")
     print("  2. Detect your GPU hardware")
-    print("  3. Install Genesis dependencies")
-    print("  4. Install the correct PyTorch version")
+    print("  3. Install the matching PyTorch build")
+    print("  4. Install Genesis and its dependencies")
     print("  5. Verify everything works")
     print("\nThis is a one-time process (5-10 minutes)")
     print("\nNote: Models will be downloaded on first use (not during setup)")
 
     input("\nPress Enter to start setup...")
 
-    # Step 0: Check Python version
     if not check_python_version():
         print("\n Setup cannot continue with incompatible Python version")
         return False
 
-    # Step 1: Detect GPU
     gpu_info = detect_gpu_hardware()
 
     if gpu_info:
@@ -329,45 +316,30 @@ def run_first_time_setup():
             print("\nSetup cancelled")
             return False
 
-    # Step 2: Install Genesis packages
-    print("\n")
-    response = input("Install Genesis dependencies? (y/n): ")
+    # torch first, so installing genesis does not pull a generic build from pypi
+    if not check_pytorch_installation(gpu_type):
+        if not install_pytorch(gpu_type) or not verify_pytorch_works():
+            print("\n PyTorch setup failed, check your GPU drivers and try again")
+            return False
+
+    response = input("\nInstall Genesis and its dependencies? (y/n): ")
     if response.lower() != 'y':
         print("\nSetup cancelled")
         return False
-
     if not install_genesis_packages():
         return False
 
-    # Step 3: Check PyTorch
-    pytorch_ok = check_pytorch_installation(gpu_type)
-
-    if not pytorch_ok:
-        print("\nInstalling PyTorch...")
-        if not install_pytorch(gpu_type):
-            return False
-
-        if not verify_pytorch_works():
-            print("\n PyTorch verification failed")
-            print("   Please check your GPU drivers and try again")
-            return False
-
-    # Final verification with Genesis
+    # new interpreter, the editable install is not importable in this process
     print_header("Final Verification")
-    try:
-        from src.core.config import get_device_info, get_optimal_device
-        device = get_optimal_device()
-        device_type, device_name, vram_gb = get_device_info()
-
-        print(f"OK: Genesis device detection working")
-        print(f"  Device: {device}")
-        print(f"  Name: {device_name}")
-        print(f"  VRAM: {vram_gb:.1f} GB")
-    except Exception as e:
-        print(f"  Warning: Genesis detection test failed: {e}")
-
-    # Mark setup as complete
-    SETUP_MARKER.touch()
+    check = subprocess.run(
+        [sys.executable, "-c",
+         "from genesis.device import get_device_info; d = get_device_info(); print(f'{d.name}, {d.vram_gb:.1f} GB')"],
+        capture_output=True, text=True,
+    )
+    if check.returncode != 0:
+        print(f"  Warning: Genesis import failed:\n{check.stderr}")
+    else:
+        print(f"OK: Genesis sees {check.stdout.strip()}")
 
     print_header("Setup Complete!")
     print("\n Genesis is ready to use!")
@@ -376,22 +348,20 @@ def run_first_time_setup():
     print("  - Fine-tune models on your videos")
     print("  - Create captions for training data")
     print("\nTo start Genesis, run:")
-    print("  python run_genesis.py")
+    print("  genesis")
 
     return True
 
 def main():
-    """Main entry point for setup."""
+    """Run the wizard and optionally launch Genesis."""
     try:
         success = run_first_time_setup()
         if success:
             print("\n" + "=" * 70)
             response = input("\nLaunch Genesis now? (y/n): ")
             if response.lower() == 'y':
-                # Launch Genesis
                 print("\nLaunching Genesis...\n")
-                import subprocess
-                subprocess.run([sys.executable, 'run_genesis.py'])
+                subprocess.run([sys.executable, "-m", "genesis"])
             return 0
         else:
             print("\n" + "=" * 70)

@@ -11,10 +11,10 @@ Genesis provides a Gradio interface for two workflows:
 
 1. **Cut:** split raw `.mp4` recordings into overlapping clips at 1280x704, 24 fps (ffmpeg).
 2. **Caption:** generate a German text-to-video prompt per clip with a vision-language model (Qwen3-VL by default; BLIP, BLIP-2 and ViT-GPT2 as lighter alternatives), with speech transcribed by Whisper as additional context.
-3. **Prepare metadata:** validate clips and export a DiffSynth-compatible `metadata.jsonl`.
+3. **Prepare dataset:** drop missing and uncaptioned clips and export the training metadata for DiffSynth.
 4. **Train:** run DiffSynth-Studio's Wan LoRA training script through `accelerate`, with the log streamed to the interface.
 
-Only one GPU job runs at a time; generation models are loaded on first use and unloaded when switching.
+Only one job runs at a time; the generation model is loaded on first use and unloaded before captioning or training.
 
 ## Requirements
 
@@ -28,29 +28,41 @@ Only one GPU job runs at a time; generation models are loaded on first use and u
 
 ## Getting started
 
-    python setup_genesis.py   # detects the GPU and installs the matching PyTorch build
-    python run_genesis.py
+    python setup_genesis.py   # detects the GPU, installs the matching PyTorch build, then Genesis
+    genesis                   # checks the environment and starts the interface
 
-The interface runs at http://127.0.0.1:7860. To re-run setup later: `python run_genesis.py --force-setup`.
+The interface runs at http://127.0.0.1:7860 (`genesis --help` for host, port and sharing). Setup can be re-run at any time.
+
+Runtime data lives below the working directory: source recordings in `data/raw_videos`, clips and metadata in `data/`, generated videos in `outputs/`, LoRA adapters in `models/lora/`.
 
 ## Configuration
 
 | Variable | Purpose |
 |---|---|
+| `GENESIS_HOME` | Base directory for data, outputs and models (default: working directory) |
 | `GENESIS_CACHE_DIR` | Model download directory (default `cache/models`) |
+| `GENESIS_ONLOAD_DEVICE` | `cpu`, `disk` or `auto` (default); `disk` streams weights from disk on machines with less than 32 GB RAM |
 | `GENESIS_CAPTION_BACKEND` | `qwen3-vl`, `blip2`, `blip` or `vit-gpt2` |
 | `GENESIS_DIFFSYNTH_ROOT` | Path to the DiffSynth-Studio clone used for training |
 | `GENESIS_DEBUG_VRAM` | Set to `1` to log VRAM usage during generation |
 
-Further defaults (clip length, LoRA rank, target modules) live in `src/core/config.py`.
+The model table and further defaults (clip length, caption settings) live in `src/genesis/config.py`.
+
+## Development
+
+    pip install -e ".[dev]"
+    pytest
+    ruff check
 
 ## Project structure
 
-    src/core/         configuration, generation pipeline, GPU job lock
-    src/finetuning/   cutting, captioning, metadata preparation, LoRA training
-    src/ui/app.py     Gradio interface
-    setup_genesis.py  first-time setup wizard
-    run_genesis.py    launcher with environment checks
+    src/genesis/
+      config.py         paths, model table, defaults
+      generation.py     text-to-video pipeline
+      finetuning/       cutting, captioning, dataset preparation, LoRA training
+      ui/app.py         Gradio interface
+      cli.py            `genesis` command
+    setup_genesis.py    setup wizard (standard library only)
 
 ## License
 
