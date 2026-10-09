@@ -8,13 +8,13 @@ import logging
 from datetime import datetime
 import traceback
 
-from src.core.genesis_pipeline import get_genesis_pipeline
+from src.core.genesis_pipeline import get_genesis_pipeline, unload_genesis_pipeline
 from src.core.job_manager import job_manager
 from src.core.config import (
-    RAW_VIDEOS_DIR, CUT_VIDEOS_DIR, METADATA_FILE,
+    RAW_VIDEOS_DIR, CUT_VIDEOS_DIR, METADATA_FILE, DIFFSYNTH_METADATA_FILE,
     LORA_CHECKPOINTS_DIR,
     CACHE_DIR, CAPTION_MODELS, CAPTION_BACKEND,
-    DEFAULT_TRAINING_CONFIG, VIDEO_CONFIG, WAN_MODEL_MAP, DIFFSYNTH_ROOT
+    DEFAULT_TRAINING_CONFIG, VIDEO_CONFIG, WAN_MODELS, DIFFSYNTH_ROOT
 )
 from src.finetuning.cut_videos import cut_videos_pipeline, check_ffmpeg_available
 from src.finetuning.create_captions import generate_captions_pipeline
@@ -44,7 +44,7 @@ def generate_video(prompt: str, duration_seconds: float, model_size: str, seed: 
             pipeline = get_genesis_pipeline(model_size)
             # Use None for seed if -1 (random), otherwise use the specified seed
             seed_value = None if seed == -1 else seed
-            output_path = pipeline.generate(prompt, int(duration_seconds), seed=seed_value)
+            output_path = pipeline.generate(prompt, int(duration_seconds), seed=None if seed_value is None else int(seed_value))
             return output_path, f"Video generated successfully!"
     except RuntimeError as e:
         return None, f"{str(e)}"
@@ -117,6 +117,7 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
                 yield f"Metadata file not found: {meta_path}"
                 return
 
+            unload_genesis_pipeline()
             log_messages = []
 
             model_id = CAPTION_MODELS.get(backend, CAPTION_MODELS.get("vit-gpt2"))
@@ -153,7 +154,7 @@ def generate_captions_ui(clips_dir: str, metadata_path: str, backend: str):
                     yield "\n".join(log_messages)
 
                 elif update["status"] == "complete":
-                    msg = f"Complete! {update['total_clips']} clips captioned"
+                    msg = f"Complete! {update['captioned']}/{update['total_clips']} clips captioned"
                     log_messages.append(msg)
                     yield "\n".join(log_messages)
 
@@ -174,7 +175,7 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, output_metadata_p
         with job_manager.acquire_gpu("preprocessing", timeout=2.0):
             videos_path = Path(videos_dir) if videos_dir else CUT_VIDEOS_DIR
             meta_path = Path(metadata_path) if metadata_path else METADATA_FILE
-            output_path = Path(output_metadata_path) if output_metadata_path else meta_path.with_name(f"{meta_path.stem}_diffsynth.jsonl")
+            output_path = Path(output_metadata_path) if output_metadata_path else DIFFSYNTH_METADATA_FILE
 
             log_messages = ["Preparing DiffSynth dataset metadata..."]
 
@@ -203,6 +204,7 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, output_metadata_p
                     msg = (
                         f"Complete! {update['total_processed']} records validated"
                         f"\nMissing videos: {update.get('missing_videos', 0)}"
+                        f"\nMissing captions: {update.get('missing_captions', 0)}"
                     )
                     if update.get("diffsynth_metadata_path"):
                         msg += f"\n DiffSynth metadata: {update['diffsynth_metadata_path']}"
@@ -221,7 +223,7 @@ def preprocess_dataset_ui(videos_dir: str, metadata_path: str, output_metadata_p
 # ============================================================================
 
 def train_lora_ui(
-    model_id: str,
+    model_size: str,
     dataset_base_path: str,
     dataset_metadata_path: str,
     output_dir: str,
@@ -234,26 +236,29 @@ def train_lora_ui(
     try:
         with job_manager.acquire_gpu("lora_training", timeout=2.0):
             dataset_base = Path(dataset_base_path) if dataset_base_path else CUT_VIDEOS_DIR
-            dataset_meta = Path(dataset_metadata_path) if dataset_metadata_path else METADATA_FILE
+            dataset_meta = Path(dataset_metadata_path) if dataset_metadata_path else DIFFSYNTH_METADATA_FILE
             output_path = Path(output_dir) if output_dir else LORA_CHECKPOINTS_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             diffsynth_root_path = diffsynth_root.strip() if diffsynth_root else (DIFFSYNTH_ROOT or None)
 
+            unload_genesis_pipeline()
             log_messages = []
 
             for update in train_lora_pipeline(
-                model_id=model_id,
+                model_size=model_size,
                 dataset_base_path=dataset_base,
                 dataset_metadata_path=dataset_meta,
                 output_dir=output_path,
                 diffsynth_root=diffsynth_root_path,
-                epochs=epochs,
-                gradient_accumulation_steps=grad_accum,
-                learning_rate=learning_rate,
-                **DEFAULT_TRAINING_CONFIG,
+                **{
+                    **DEFAULT_TRAINING_CONFIG,
+                    "epochs": int(epochs),
+                    "gradient_accumulation_steps": int(grad_accum),
+                    "learning_rate": float(learning_rate),
+                },
             ):
                 if update["status"] == "error":
                     log_messages.append(f"{update['message']}")
-                    yield "\n".join(log_messages), None
+                    yield "\n".join(log_messages)
                     return
 
                 elif update["status"] == "init":
@@ -262,7 +267,7 @@ def train_lora_ui(
                         log_messages.append(f"Train script: {update['train_script']}")
                     if update.get("command"):
                         log_messages.append(f"Command: {update['command']}")
-                    yield "\n".join(log_messages), None
+                    yield "\n".join(log_messages)
 
                 elif update["status"] == "training":
                     if "message" in update:
@@ -271,18 +276,18 @@ def train_lora_ui(
                     if len(log_messages) > 20:
                         log_messages = log_messages[-20:]
 
-                    yield "\n".join(log_messages), None
+                    yield "\n".join(log_messages)
 
                 elif update["status"] == "complete":
                     msg = f"Complete! Model saved to {update.get('output_path', output_path)}"
                     log_messages.append(msg)
-                    yield "\n".join(log_messages), None
+                    yield "\n".join(log_messages)
 
     except RuntimeError as e:
-        yield f"{str(e)}", None
+        yield f"{str(e)}"
     except Exception as e:
         logger.error(f"Training error: {e}", exc_info=True)
-        yield f"Error: {str(e)}\n{traceback.format_exc()}", None
+        yield f"Error: {str(e)}\n{traceback.format_exc()}"
 
 
 # ============================================================================
@@ -301,7 +306,7 @@ def get_gpu_status():
 
     try:
         vram_used = torch.cuda.memory_allocated(0) / 1e9
-    except:
+    except RuntimeError:
         vram_used = 0.0
 
     status_text = f"🖥{device_name} | VRAM: {vram_used:.1f}/{vram_gb:.1f} GB"
@@ -358,14 +363,14 @@ def build_ui():
                     with gr.Column(scale=1):
                         gen_model = gr.Dropdown(
                             label="Model Size",
-                            choices=["5B", "14B", "14B-2.1", "1.3B"],
+                            choices=list(WAN_MODELS),
                             value="5B"
                         )
                         gen_duration = gr.Slider(
                             label="Duration (seconds)",
                             minimum=1,
-                            maximum=30,
-                            value=8,
+                            maximum=10,
+                            value=5,
                             step=1
                         )
                         with gr.Row():
@@ -434,7 +439,7 @@ def build_ui():
                     )
 
                 with gr.Accordion("Step 2: Generate Captions", open=False):
-                    gr.Markdown("Generate descriptive captions for each clip using lightweight image captioning models")
+                    gr.Markdown("Generate a text prompt for each clip; failed clips are left empty and skipped in Step 3")
 
                     with gr.Row():
                         caption_clips_dir = gr.Textbox(
@@ -452,7 +457,7 @@ def build_ui():
                             ("qwen3-vl (Qwen/Qwen3-VL-2B-Instruct) - Multi-frame, Best Quality", "qwen3-vl"),
                             ("vit-gpt2 (nlpconnect/vit-gpt2-image-captioning) - Low VRAM, Fast", "vit-gpt2"),
                             ("blip (Salesforce/blip-image-captioning-base) - Better Accuracy", "blip"),
-                            ("blip2 (Salesforce/blip2-flan-t5-small) - Strongest Single-frame", "blip2"),
+                            (f"blip2 ({CAPTION_MODELS['blip2']}) - Strongest Single-frame", "blip2"),
                         ],
                         value=CAPTION_BACKEND,
                         info="qwen3-vl (default) analyzes multiple frames for coherent captions. Others process single frames."
@@ -481,7 +486,7 @@ def build_ui():
                         )
                         prep_output_metadata = gr.Textbox(
                             label="Output DiffSynth Metadata (.jsonl)",
-                            value=str(METADATA_FILE.with_name(f"{METADATA_FILE.stem}_diffsynth.jsonl"))
+                            value=str(DIFFSYNTH_METADATA_FILE)
                         )
 
                     with gr.Row():
@@ -502,16 +507,16 @@ def build_ui():
                         with gr.Column():
                             train_model_id = gr.Dropdown(
                                 label="Base Model",
-                                choices=list(WAN_MODEL_MAP.values()),
-                                value=WAN_MODEL_MAP["1.3B"]
+                                choices=[(f"{key} ({spec.model_id})", key) for key, spec in WAN_MODELS.items()],
+                                value="1.3B"
                             )
                             train_dataset_base_path = gr.Textbox(
                                 label="Dataset Base Path (video files)",
                                 value=str(CUT_VIDEOS_DIR)
                             )
                             train_dataset_metadata_path = gr.Textbox(
-                                label="Dataset Metadata Path",
-                                value=str(METADATA_FILE)
+                                label="Dataset Metadata Path (from Step 3)",
+                                value=str(DIFFSYNTH_METADATA_FILE)
                             )
                             train_diffsynth_root = gr.Textbox(
                                 label="DiffSynth Root (optional)",
@@ -521,7 +526,7 @@ def build_ui():
 
                         with gr.Column():
                             train_epochs = gr.Slider(label="Epochs", minimum=1, maximum=20, value=5, step=1)
-                            train_grad_accum = gr.Slider(label="Gradient Accumulation", minimum=1, maximum=16, value=4, step=1)
+                            train_grad_accum = gr.Slider(label="Gradient Accumulation", minimum=1, maximum=16, value=DEFAULT_TRAINING_CONFIG["gradient_accumulation_steps"], step=1)
                             train_lr = gr.Number(label="Learning Rate", value=1e-4, precision=6)
 
                     train_output_dir = gr.Textbox(
@@ -531,9 +536,7 @@ def build_ui():
 
                     train_button = gr.Button("Start Training", variant="primary", size="lg")
 
-                    with gr.Row():
-                        train_log = gr.Textbox(label="Training Log", lines=12, interactive=False)
-                        train_loss = gr.Number(label="Current Loss", interactive=False)
+                    train_log = gr.Textbox(label="Training Log", lines=12, interactive=False)
 
                     train_button.click(
                         fn=train_lora_ui,
@@ -547,7 +550,7 @@ def build_ui():
                             train_grad_accum,
                             train_lr
                         ],
-                        outputs=[train_log, train_loss]
+                        outputs=train_log
                     )
 
         gr.Markdown("---")

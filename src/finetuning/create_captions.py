@@ -1,3 +1,5 @@
+"""Per-clip caption generation for the fine-tuning dataset (vision-language backends plus whisper transcripts)."""
+
 import json
 from pathlib import Path
 import cv2
@@ -36,6 +38,9 @@ logger = logging.getLogger("CaptionGen")
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+WHISPER_MODEL_ID = "openai/whisper-base"
+TRANSCRIPT_BACKENDS = {"qwen3-vl"}
 
 
 SYSTEM_PROMPT = """**Situation**
@@ -260,11 +265,7 @@ class BaseCaptionGenerator:
 
 
 class VitGpt2Generator(BaseCaptionGenerator):
-    """Lightweight ViT-GPT2 image captioning generator (default).
-
-    Uses VisionEncoderDecoderModel directly with processor for image captioning.
-    This is chosen as the default because it is small and runs well under 16GB VRAM.
-    """
+    """ViT-GPT2 image captioning, smallest backend; captions each frame separately in english."""
 
     def __init__(self, model_id: str, cache_dir: str, device: Optional[str] = None):
         super().__init__(model_id, cache_dir)
@@ -300,34 +301,19 @@ class VitGpt2Generator(BaseCaptionGenerator):
 
         logger.info(f"Loading image captioning model: {self.model_id} (device={self.device})...")
         try:
-            # Load feature extractor for image preprocessing
-            # Try to load from cache first, then from pretrained
-            try:
-                self.feature_extractor = ViTImageProcessor.from_pretrained(
-                    self.model_id,
-                    cache_dir=self.cache_dir,
-                    local_files_only=True,  # Use cached models without network calls
-                )
-            except Exception as e:
-                logger.warning(f"Could not load ViTImageProcessor from cache, using default: {e}")
-                # Use default ViT image processor configuration
-                self.feature_extractor = ViTImageProcessor(
-                    size={"height": 384, "width": 384},
-                    do_normalize=True,
-                    image_mean=[0.5, 0.5, 0.5],
-                    image_std=[0.5, 0.5, 0.5],
-                )
+            self.feature_extractor = ViTImageProcessor.from_pretrained(
+                self.model_id,
+                cache_dir=self.cache_dir,
+            )
 
             self.model = VisionEncoderDecoderModel.from_pretrained(
                 self.model_id,
                 cache_dir=self.cache_dir,
-                local_files_only=True,
             ).to(self.device)
 
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_id,
                 cache_dir=self.cache_dir,
-                local_files_only=True,
             )
 
             self.model.eval()
@@ -338,11 +324,11 @@ class VitGpt2Generator(BaseCaptionGenerator):
 
         logger.info("Caption model loaded")
 
-    def generate_caption(self, frames: list[Image.Image]) -> str:
+    def generate_caption(self, frames: list[Image.Image], transcript: str = "") -> str:
         self.load_model()
 
         if not frames:
-            return "weißes Bild mit Text"
+            return ""
 
         # Process each frame and generate descriptions
         try:
@@ -437,11 +423,11 @@ class BlipGenerator(BaseCaptionGenerator):
 
         logger.info("BLIP model loaded")
 
-    def generate_caption(self, frames: list[Image.Image]) -> str:
+    def generate_caption(self, frames: list[Image.Image], transcript: str = "") -> str:
         self.load_model()
 
         if not frames:
-            return "weißes Bild mit Text"
+            return ""
 
         try:
             frame_descriptions = []
@@ -519,11 +505,11 @@ class Blip2Generator(BaseCaptionGenerator):
 
         logger.info("BLIP-2 model loaded")
 
-    def generate_caption(self, frames: list[Image.Image]) -> str:
+    def generate_caption(self, frames: list[Image.Image], transcript: str = "") -> str:
         self.load_model()
 
         if not frames:
-            return "weißes Bild mit Text"
+            return ""
 
         try:
             frame_descriptions = []
@@ -587,12 +573,13 @@ class QwenVLGenerator(BaseCaptionGenerator):
         try:
             self.processor = AutoProcessor.from_pretrained(
                 self.model_id,
+                cache_dir=self.cache_dir,
                 trust_remote_code=True,
             )
 
-            # Use SDPA attention for better ROCm stability (flash_attention_2 is experimental on ROCm)
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_id,
+                cache_dir=self.cache_dir,
                 dtype=torch.bfloat16,
                 device_map="auto",
             )
@@ -605,17 +592,24 @@ class QwenVLGenerator(BaseCaptionGenerator):
 
         logger.info("Qwen VL model loaded")
 
-    def generate_caption(self, frames: list[Image.Image]) -> str:
+    def generate_caption(self, frames: list[Image.Image], transcript: str = "") -> str:
         """Generate a single comprehensive caption from multiple keyframes.
 
         Leverages Qwen3-VL's multi-image understanding to synthesize one cohesive
         caption from all keyframes, focusing on visual changes and temporal progression.
         Uses the SYSTEM_PROMPT to guide generation toward training-appropriate descriptions.
+
+        Args:
+            frames: Keyframes in temporal order.
+            transcript: Speech in the clip, passed as context; may be empty.
+
+        Returns:
+            The caption, or an empty string if there are no frames.
         """
         self.load_model()
 
         if not frames:
-            return "weißes Bild mit Text"
+            return ""
 
         inputs = None
         generated_ids = None
@@ -639,6 +633,11 @@ class QwenVLGenerator(BaseCaptionGenerator):
             # This guides the model to create a single cohesive caption focusing on
             # visual changes rather than repetitively describing static elements
             instruction_text = f"{SYSTEM_PROMPT}\n\nAnalysiere die oben gezeigten Bilder. Sie zeigen eine zeitliche Abfolge aus einem Video. Erstelle einen einzelnen, zusammenhängenden Text-to-Video-Prompt, der die visuelle Entwicklung und Veränderungen über die Zeit beschreibt."
+            if transcript:
+                instruction_text += (
+                    "\n\nTranskript des Gesprochenen in diesem Abschnitt (nur als Kontext, nicht wörtlich übernehmen):\n"
+                    f"{transcript}"
+                )
 
             message_content.append({
                 "type": "text",
@@ -803,121 +802,107 @@ def generate_captions_pipeline(
             logger.error(f"Failed to load summarizer {CAPTION_SUMMARIZER_ID}: {e}")
             summarizer = None
 
-    # Initialize Whisper model for audio transcription
+    # transcripts only help backends that take text context
     whisper_model = None
-    try:
-        whisper_model = pipeline(
-            "automatic-speech-recognition",
-            model="openai/whisper-base",
-            device=(0 if torch.cuda.is_available() else -1),
-            cache_dir=cache_dir,
-        )
-        logger.info("Whisper model loaded")
-    except Exception as e:
-        logger.warning(f"Failed to load Whisper model: {e}")
-        whisper_model = None
+    if resolved_backend in TRANSCRIPT_BACKENDS:
+        try:
+            whisper_model = pipeline(
+                "automatic-speech-recognition",
+                model=WHISPER_MODEL_ID,
+                device=(0 if torch.cuda.is_available() else -1),
+                model_kwargs={"cache_dir": cache_dir},
+            )
+            logger.info("Whisper model loaded")
+        except Exception as e:
+            logger.warning(f"Failed to load Whisper model: {e}")
 
-    # Process clips with cleanup guarantee
+    captioned = 0
     try:
-        # Process clips
         for idx, clip in enumerate(clips, 1):
             video_path = clips_dir / clip["file_name"]
+            # cleared until a caption succeeds, so failed clips are skipped later
+            clip["prompt"] = clip["text"] = clip["audio_text"] = ""
 
             if not video_path.exists():
-                clip["text"] = "white screen with text"
-                clip["prompt"] = clip["text"]
-                clip["audio_text"] = ""
                 yield {
                     "status": "processing",
                     "clip": clip["file_name"],
-                    "caption": clip["text"],
+                    "caption": "",
                     "progress": (idx, len(clips)),
-                    "message": f"Video not found, using fallback caption"
+                    "message": "Video not found, skipped",
                 }
                 continue
 
             try:
-                # Extract audio and transcribe if Whisper is available
-                audio_text = ""
-                if whisper_model is not None:
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
-                        wav_path = wav_file.name
-
-                    try:
-                        if extract_audio_from_video(video_path, wav_path):
-                            audio_text = transcribe_audio_whisper(wav_path, whisper_model)
-                            logger.info(f"Audio transcribed: {clip['file_name'][:50]}... -> {audio_text[:80] if audio_text else '(empty)'}")
-                        else:
-                            logger.warning(f"Failed to extract audio from {clip['file_name']}")
-                    finally:
-                        # Clean up temporary wav file
-                        try:
-                            Path(wav_path).unlink()
-                        except:
-                            pass
-
-                # Generate visual caption
+                audio_text = _transcribe_clip(video_path, whisper_model) if whisper_model else ""
                 frames = generator.video_to_frames(video_path, max_frames)
-                per_frame_caption = generator.generate_caption(frames)
+                caption = generator.generate_caption(frames, transcript=audio_text)
 
-                # If summarizer available/enabled, run it to make a concise German prompt
-                final_caption = per_frame_caption
-                if summarizer is not None and per_frame_caption:
+                if summarizer is not None and caption:
                     try:
-                        # small safety: bound input length
-                        input_text = per_frame_caption
-                        summary = summarizer(input_text, max_length=160, min_length=40, do_sample=False)
-                        if isinstance(summary, list) and len(summary) > 0:
-                            final_caption = summary[0].get("summary_text", final_caption)
+                        summary = summarizer(caption, max_length=160, min_length=40, do_sample=False)
+                        if isinstance(summary, list) and summary:
+                            caption = summary[0].get("summary_text", caption)
                     except Exception as e:
                         logger.error(f"Summarizer error for {clip['file_name']}: {e}")
 
-                clip["text"] = final_caption
-                clip["prompt"] = final_caption
                 clip["audio_text"] = audio_text
+                if not caption:
+                    yield {
+                        "status": "processing",
+                        "clip": clip["file_name"],
+                        "caption": "",
+                        "progress": (idx, len(clips)),
+                        "message": "Empty caption, skipped",
+                    }
+                    continue
 
+                clip["text"] = clip["prompt"] = caption
+                captioned += 1
                 yield {
                     "status": "processing",
                     "clip": clip["file_name"],
-                    "caption": final_caption,
+                    "caption": caption,
                     "audio_text": audio_text,
-                    "progress": (idx, len(clips))
+                    "progress": (idx, len(clips)),
                 }
 
             except Exception as e:
                 logger.error(f"Error generating caption for {clip['file_name']}: {e}")
-                clip["text"] = "error generating caption"
-                clip["prompt"] = clip["text"]
-                clip["audio_text"] = ""
                 yield {
                     "status": "processing",
                     "clip": clip["file_name"],
-                    "caption": clip["text"],
+                    "caption": "",
                     "progress": (idx, len(clips)),
-                    "message": f"Error: {str(e)}"
+                    "message": f"Error: {e}",
                 }
             finally:
-                # Per-caption cleanup to avoid VRAM accumulation
                 if hasattr(generator, "cleanup_step"):
                     generator.cleanup_step()
+                # saved per clip so an interrupted run keeps finished captions
+                _write_metadata(metadata_path, clips)
 
-        # Save updated metadata
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            for clip in clips:
-                f.write(json.dumps(clip, ensure_ascii=False) + "\n")
-
-        logger.info(f"Finished! {len(clips)} clips now have captions.")
-        yield {"status": "complete", "total_clips": len(clips)}
+        logger.info(f"Finished! {captioned}/{len(clips)} clips captioned.")
+        yield {"status": "complete", "total_clips": len(clips), "captioned": captioned}
 
     finally:
-        # Ensure cleanup happens even on early termination (Ctrl+C, exception, etc.)
-        if hasattr(generator, 'cleanup'):
-            generator.cleanup()
-        elif hasattr(generator, 'model') and generator.model is not None:
-            logger.info("Cleaning up model from VRAM...")
-            del generator.model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        generator.cleanup()
 
 
+def _transcribe_clip(video_path: Path, whisper_model: Any) -> str:
+    """Extract a clip's audio to a temporary wav and transcribe it; empty string on failure."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        wav_path = Path(tmp_dir) / "audio.wav"
+        if not extract_audio_from_video(video_path, wav_path):
+            logger.warning(f"Failed to extract audio from {video_path.name}")
+            return ""
+        return transcribe_audio_whisper(wav_path, whisper_model)
 
+
+def _write_metadata(metadata_path: Path, clips: list[dict[str, Any]]) -> None:
+    """Rewrite the metadata jsonl atomically."""
+    tmp_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for clip in clips:
+            f.write(json.dumps(clip, ensure_ascii=False) + "\n")
+    tmp_path.replace(metadata_path)

@@ -23,20 +23,16 @@ def _load_records_with_diffsynth(metadata_path: Path) -> list[dict[str, Any]]:
 
 
 def _normalize_for_diffsynth(record: dict[str, Any]) -> dict[str, Any]:
-    """Normalize one record to canonical fields used by Genesis + DiffSynth."""
-    file_name = record.get("file_name") or record.get("video")
+    """Map a genesis metadata row onto the `video` and `prompt` keys read by DiffSynth's train.py."""
+    file_name = record.get("video") or record.get("file_name")
     if not file_name:
         raise ValueError("Metadata record is missing 'file_name' (or fallback 'video').")
 
-    prompt = record.get("prompt")
-    if prompt is None:
-        prompt = record.get("text", "")
+    prompt = record.get("prompt") or record.get("text") or ""
 
     normalized: dict[str, Any] = {
-        "file_name": str(file_name),
-        "prompt": str(prompt or ""),
-        # Keep text for backward compatibility with existing flows.
-        "text": str(record.get("text", prompt or "")),
+        "video": str(file_name),
+        "prompt": str(prompt).strip(),
     }
 
     for key in ("audio_text", "original_video", "start_time"):
@@ -47,6 +43,7 @@ def _normalize_for_diffsynth(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_jsonl(records: list[dict[str, Any]], output_path: Path) -> None:
+    """Write records as utf-8 jsonl, one object per line."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         for row in records:
@@ -80,26 +77,37 @@ def prepare_diffsynth_dataset(
 
     normalized_records: list[dict[str, Any]] = []
     missing_videos = 0
+    missing_captions = 0
 
     for idx, record in enumerate(raw_records, 1):
         try:
             normalized = _normalize_for_diffsynth(record)
-            video_path = videos_dir / normalized["file_name"]
+            video_path = videos_dir / normalized["video"]
 
             if not video_path.exists():
                 missing_videos += 1
                 yield {
                     "status": "processing",
-                    "video": normalized["file_name"],
+                    "video": normalized["video"],
                     "progress": (idx, len(raw_records)),
                     "message": "Video file not found, skipping",
+                }
+                continue
+
+            if not normalized["prompt"]:
+                missing_captions += 1
+                yield {
+                    "status": "processing",
+                    "video": normalized["video"],
+                    "progress": (idx, len(raw_records)),
+                    "message": "No caption, skipping",
                 }
                 continue
 
             normalized_records.append(normalized)
             yield {
                 "status": "processing",
-                "video": normalized["file_name"],
+                "video": normalized["video"],
                 "progress": (idx, len(raw_records)),
                 "message": "Validated",
             }
@@ -122,22 +130,6 @@ def prepare_diffsynth_dataset(
         "total_processed": len(normalized_records),
         "total_input_records": len(raw_records),
         "missing_videos": missing_videos,
+        "missing_captions": missing_captions,
         "diffsynth_metadata_path": str(output_metadata_path),
     }
-
-
-def preprocess_videos_to_latents(
-    videos_dir: Path | str,
-    metadata_path: Path | str,
-    output_cache_dir: Path | str,
-    vae=None,
-    device: str = "cuda",
-    num_frames: int = 33,
-    target_height: int = 720,
-    target_width: int = 1280,
-    export_diffsynth_metadata: bool = True,
-    diffsynth_metadata_path: Path | str | None = None,
-) -> Generator[Dict[str, Any], None, None]:
-    """Compatibility wrapper: old name now delegates to metadata preparation only."""
-    del output_cache_dir, vae, device, num_frames, target_height, target_width, export_diffsynth_metadata
-    yield from prepare_diffsynth_dataset(videos_dir, metadata_path, diffsynth_metadata_path)

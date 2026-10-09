@@ -7,29 +7,19 @@ import shlex
 import subprocess
 from typing import Generator, Dict, Any
 
+from src.core.config import CACHE_DIR, WAN_MODELS, TrainRun, WanModelSpec
+
 logger = logging.getLogger("LoRA")
 
-MODEL_ORIGIN_MAP = {
-    "Wan-AI/Wan2.1-T2V-1.3B": "diffusion_pytorch_model*.safetensors,models_t5_umt5-xxl-enc-bf16.pth,Wan2.1_VAE.pth",
-    "Wan-AI/Wan2.1-T2V-14B": "diffusion_pytorch_model*.safetensors,models_t5_umt5-xxl-enc-bf16.pth,Wan2.1_VAE.pth",
-}
 
-
-def _format_model_id_with_origin_paths(model_id: str, model_id_with_origin_paths: str | None) -> str:
-    if model_id_with_origin_paths:
-        return model_id_with_origin_paths
-
-    origin_patterns = MODEL_ORIGIN_MAP.get(model_id)
-    if not origin_patterns:
-        raise ValueError(
-            "No default origin-file mapping found for this model. "
-            "Please provide `model_id_with_origin_paths` manually."
-        )
-
-    return ",".join(f"{model_id}:{pattern}" for pattern in origin_patterns.split(","))
+def build_origin_paths(spec: WanModelSpec, run: TrainRun) -> str:
+    """Build DiffSynth's `--model_id_with_origin_paths` value for one training run."""
+    patterns = (run.dit_pattern, "models_t5_umt5-xxl-enc-bf16.pth", spec.train_vae_file)
+    return ",".join(f"{spec.model_id}:{pattern}" for pattern in patterns)
 
 
 def _resolve_train_script(diffsynth_root: pathlib.Path | str | None) -> pathlib.Path:
+    """Find DiffSynth's wanvideo train.py in the given root, `GENESIS_DIFFSYNTH_ROOT` or the installed package."""
     candidates: list[pathlib.Path] = []
 
     if diffsynth_root:
@@ -65,6 +55,7 @@ def _resolve_train_script(diffsynth_root: pathlib.Path | str | None) -> pathlib.
 
 
 def _sanitize_num_frames(num_frames: int | None) -> int | None:
+    """Reject frame counts that do not follow wan's 4n+1 rule."""
     if num_frames is None:
         return None
     if (num_frames - 1) % 4 != 0:
@@ -72,13 +63,34 @@ def _sanitize_num_frames(num_frames: int | None) -> int | None:
     return num_frames
 
 
+def _build_command(
+    train_script_path: pathlib.Path,
+    accelerate_config_file: pathlib.Path | str | None,
+    *flag_values: Any,
+    find_unused_parameters: bool,
+    initialize_model_on_cpu: bool,
+) -> list[str]:
+    """Assemble the accelerate command; `flag_values` alternates flag and value, `None` values are skipped."""
+    cmd = ["accelerate", "launch"]
+    if accelerate_config_file:
+        cmd += ["--config_file", str(accelerate_config_file)]
+    cmd.append(str(train_script_path))
+    for flag, value in zip(flag_values[::2], flag_values[1::2]):
+        if value is not None and value != "":
+            cmd += [flag, str(value)]
+    if find_unused_parameters:
+        cmd.append("--find_unused_parameters")
+    if initialize_model_on_cpu:
+        cmd.append("--initialize_model_on_cpu")
+    return cmd
+
+
 def train_lora_pipeline(
-    model_id: str = "Wan-AI/Wan2.1-T2V-1.3B",
+    model_size: str = "1.3B",
     dataset_base_path: pathlib.Path | str = "src/finetuning/dataset/cut_videos",
     dataset_metadata_path: pathlib.Path | str = "src/finetuning/dataset/metadata.jsonl",
     output_dir: pathlib.Path | str = "models/lora_checkpoints",
     diffsynth_root: pathlib.Path | str | None = None,
-    model_id_with_origin_paths: str | None = None,
     epochs: int = 5,
     learning_rate: float = 1e-4,
     dataset_repeat: int = 100,
@@ -98,7 +110,15 @@ def train_lora_pipeline(
     accelerate_config_file: pathlib.Path | str | None = None,
     initialize_model_on_cpu: bool = False,
 ) -> Generator[Dict[str, Any], None, None]:
-    """Train LoRA using DiffSynth's official wanvideo training script."""
+    """Train LoRA adapters with DiffSynth's wanvideo training script.
+
+    Runs one `accelerate launch` per entry in the model's `train_runs`; mixture-of-experts
+    models (Wan2.2 A14B) get one adapter per expert in a subfolder of `output_dir`.
+    Remaining arguments map one-to-one onto DiffSynth's train.py flags.
+
+    Yields:
+        Progress events: `init` per run, `training` per log line, then `complete` or `error`.
+    """
 
     try:
         output_dir = pathlib.Path(output_dir)
@@ -118,77 +138,69 @@ def train_lora_pipeline(
             raise ValueError("width must be a multiple of 16 for Wan training.")
         _sanitize_num_frames(num_frames)
 
+        if model_size not in WAN_MODELS:
+            raise ValueError(f"Unknown model size {model_size!r}, expected one of {list(WAN_MODELS)}")
+        spec = WAN_MODELS[model_size]
         train_script_path = _resolve_train_script(diffsynth_root)
-        model_id_with_origin_paths = _format_model_id_with_origin_paths(model_id, model_id_with_origin_paths)
 
-        cmd: list[str] = [
-            "accelerate",
-            "launch",
-        ]
+        env = {**os.environ, "DIFFSYNTH_MODEL_BASE_PATH": str(CACHE_DIR)}
+        multi_run = len(spec.train_runs) > 1
 
-        if accelerate_config_file:
-            cmd.extend(["--config_file", str(pathlib.Path(accelerate_config_file))])
+        for run in spec.train_runs:
+            run_output_dir = output_dir / run.name if multi_run else output_dir
+            cmd = _build_command(
+                train_script_path, accelerate_config_file,
+                "--dataset_base_path", dataset_base_path,
+                "--dataset_metadata_path", dataset_metadata_path,
+                "--dataset_repeat", dataset_repeat,
+                "--dataset_num_workers", dataset_num_workers,
+                "--data_file_keys", data_file_keys,
+                "--model_id_with_origin_paths", build_origin_paths(spec, run),
+                "--learning_rate", learning_rate,
+                "--num_epochs", epochs,
+                "--remove_prefix_in_ckpt", remove_prefix_in_ckpt,
+                "--output_path", run_output_dir,
+                "--lora_base_model", lora_base_model,
+                "--lora_target_modules", lora_target_modules,
+                "--lora_rank", lora_rank,
+                "--gradient_accumulation_steps", gradient_accumulation_steps,
+                "--min_timestep_boundary", run.min_timestep_boundary,
+                "--max_timestep_boundary", run.max_timestep_boundary,
+                "--height", height,
+                "--width", width,
+                "--num_frames", num_frames,
+                "--save_steps", save_steps,
+                "--extra_inputs", extra_inputs,
+                find_unused_parameters=find_unused_parameters,
+                initialize_model_on_cpu=initialize_model_on_cpu,
+            )
 
-        cmd.extend([
-            str(train_script_path),
-            "--dataset_base_path", str(dataset_base_path),
-            "--dataset_metadata_path", str(dataset_metadata_path),
-            "--dataset_repeat", str(dataset_repeat),
-            "--dataset_num_workers", str(dataset_num_workers),
-            "--data_file_keys", data_file_keys,
-            "--model_id_with_origin_paths", model_id_with_origin_paths,
-            "--learning_rate", str(learning_rate),
-            "--num_epochs", str(epochs),
-            "--remove_prefix_in_ckpt", remove_prefix_in_ckpt,
-            "--output_path", str(output_dir),
-            "--lora_base_model", lora_base_model,
-            "--lora_target_modules", lora_target_modules,
-            "--lora_rank", str(lora_rank),
-            "--gradient_accumulation_steps", str(gradient_accumulation_steps),
-        ])
+            yield {
+                "status": "init",
+                "message": f"Starting DiffSynth Wan LoRA training ({spec.model_id}, {run.name})...",
+                "backend": "diffsynth",
+                "command": " ".join(shlex.quote(part) for part in cmd),
+                "train_script": str(train_script_path),
+            }
 
-        if height is not None:
-            cmd.extend(["--height", str(height)])
-        if width is not None:
-            cmd.extend(["--width", str(width)])
-        if num_frames is not None:
-            cmd.extend(["--num_frames", str(num_frames)])
-        if save_steps is not None:
-            cmd.extend(["--save_steps", str(save_steps)])
-        if extra_inputs:
-            cmd.extend(["--extra_inputs", extra_inputs])
-        if find_unused_parameters:
-            cmd.append("--find_unused_parameters")
-        if initialize_model_on_cpu:
-            cmd.append("--initialize_model_on_cpu")
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
 
-        pretty_cmd = " ".join(shlex.quote(part) for part in cmd)
-        yield {
-            "status": "init",
-            "message": "Starting DiffSynth Wan LoRA training...",
-            "backend": "diffsynth",
-            "command": pretty_cmd,
-            "train_script": str(train_script_path),
-        }
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                line = raw_line.rstrip()
+                if line:
+                    yield {"status": "training", "message": line}
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-
-        assert process.stdout is not None
-        for raw_line in process.stdout:
-            line = raw_line.rstrip()
-            if not line:
-                continue
-            yield {"status": "training", "message": line}
-
-        return_code = process.wait()
-        if return_code != 0:
-            raise RuntimeError(f"DiffSynth training failed with exit code {return_code}")
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(f"DiffSynth training ({run.name}) failed with exit code {return_code}")
 
         yield {
             "status": "complete",
@@ -199,6 +211,3 @@ def train_lora_pipeline(
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         yield {"status": "error", "message": str(e)}
-
-
-
