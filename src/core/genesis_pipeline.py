@@ -1,10 +1,13 @@
+"""DiffSynth-based Wan text-to-video generation with lazy, singleton model loading."""
 import torch
 from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from pathlib import Path
 import logging
 import os
-from src.core.config import WAN_MODEL_MAP, get_device_info
+from src.core.config import (
+    CACHE_DIR, OUTPUTS_DIR, SHARED_COMPONENTS_ID, TOKENIZER_MODEL_ID, WAN_MODELS, get_device_info,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Genesis")
@@ -24,17 +27,17 @@ def _log_cuda_memory(stage: str) -> None:
     logger.info("VRAM %s | allocated=%.2f GB | reserved=%.2f GB | max=%.2f GB", stage, allocated, reserved, max_alloc)
 
 class GenesisPipeline:
+    """DiffSynth Wan pipeline for one model size, with weights offloaded to disk and cpu."""
+
     def __init__(self, model_size: str = "5B"):
+        if model_size not in WAN_MODELS:
+            raise ValueError(f"Unknown model size {model_size!r}, expected one of {list(WAN_MODELS)}")
         self.model_size = model_size
-        self.model_id = WAN_MODEL_MAP.get(model_size, WAN_MODEL_MAP["5B"])
-        self.shared_components_id = os.getenv(
-            "GENESIS_DIFFSYNTH_SHARED_MODEL_ID",
-            "DiffSynth-Studio/Wan-Series-Converted-Safetensors",
-        )
+        self.spec = WAN_MODELS[model_size]
+        self.model_id = self.spec.model_id
         self.torch_dtype = torch.bfloat16
         logger.info(f"Loading Model -> {self.model_id}")
-        logger.info("Shared encoder/VAE source: %s", self.shared_components_id)
-        logger.info("Using torch dtype: %s", self.torch_dtype)
+        logger.info("Shared encoder/VAE source: %s", SHARED_COMPONENTS_ID)
 
         _log_cuda_memory("before_vae_load")
 
@@ -49,64 +52,50 @@ class GenesisPipeline:
             "computation_device": "cuda",
         }
 
+        def config(model_id: str, pattern: str, **kwargs) -> ModelConfig:
+            return ModelConfig(model_id=model_id, origin_file_pattern=pattern, local_model_path=CACHE_DIR, **kwargs)
+
+        model_configs = [config(self.model_id, pattern, **vram_config) for pattern in self.spec.dit_patterns]
+        model_configs += [
+            config(SHARED_COMPONENTS_ID, "models_t5_umt5-xxl-enc-bf16*.safetensors", **vram_config),
+            config(SHARED_COMPONENTS_ID, self.spec.vae_file, **vram_config),
+        ]
+
+        # leave headroom for activations outside the offload budget
         total_vram_gb = torch.cuda.mem_get_info()[1] / (1024 ** 3)
         vram_limit_gb = max(total_vram_gb - 2, 1.0)
         logger.info("Total VRAM: %.1f GB | Setting pipeline VRAM limit to %.1f GB", total_vram_gb, vram_limit_gb)
         self.pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=self.torch_dtype,
             device="cuda",
-            model_configs=[
-                ModelConfig(model_id=self.model_id,
-                            origin_file_pattern="diffusion_pytorch_model*.safetensors", **vram_config),
-                ModelConfig(
-                    model_id=self.shared_components_id,
-                    origin_file_pattern="models_t5_umt5-xxl-enc-bf16*.safetensors",
-                    **vram_config,
-                ),
-                ModelConfig(
-                    model_id=self.shared_components_id,
-                    origin_file_pattern="Wan2.1_VAE*.safetensors",
-                    **vram_config,
-                ),
-            ],
-            tokenizer_config=ModelConfig(model_id=self.model_id, origin_file_pattern="google/umt5-xxl/"),
+            model_configs=model_configs,
+            tokenizer_config=config(TOKENIZER_MODEL_ID, "google/umt5-xxl/"),
             vram_limit=vram_limit_gb,
         )
 
         _, device_name, vram_gb = get_device_info()
         logger.info("Model loaded. GPU: %s | VRAM: %.1f GB", device_name, vram_gb)
 
-    def _get_model_params(self) -> dict:
-        """Get model-specific parameters for generation."""
-        params = {
-            "height": 720,
-            "width": 1280,
-            "num_inference_steps": 20,
-        }
+    def generate(self, prompt: str, duration_sec: int = 5, output_path: str | None = None, seed: int | None = None) -> str:
+        """Generate a video and save it as mp4.
 
-        match self.model_size:
-            case "5B":
-                params["height"] = 704
-                params["num_inference_steps"] = 50
-            case "1.3B":
-                params["height"] = 480
-                params["width"] = 832
-                params["num_inference_steps"] = 40
+        Args:
+            prompt: Text prompt.
+            duration_sec: Target length; rounded down to a valid Wan frame count.
+            output_path: Target file, derived from the prompt if omitted.
+            seed: Random seed, drawn randomly if omitted.
 
-        return params
-
-    def generate(self, prompt: str, duration_sec: int = 8, output_path: str | None = None, seed: int | None = None):
-        fps = 16
+        Returns:
+            Path of the saved video.
+        """
+        fps = self.spec.fps
         requested_frames = max(fps, int(duration_sec * fps))
-        # Wan works best with frame counts following 4n+1.
+        # wan needs 4n+1 frames
         frames = ((requested_frames - 1) // 4) * 4 + 1
-
-        params = self._get_model_params()
 
         negative_prompt = "low quality, blurry, distorted, noisy, artifacts, unreadable text, static, still image"
 
-        if seed is None:
-            seed = torch.seed()
+        seed = int(seed) if seed is not None else torch.seed() % 2**32
 
         if os.getenv("GENESIS_DEBUG_VRAM", "0") == "1" and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -120,10 +109,10 @@ class GenesisPipeline:
                 video = self.pipe(
                     prompt=prompt,
                     negative_prompt=negative_prompt,
-                    height=params["height"],
-                    width=params["width"],
+                    height=self.spec.height,
+                    width=self.spec.width,
                     num_frames=frames,
-                    num_inference_steps=params["num_inference_steps"],
+                    num_inference_steps=self.spec.num_inference_steps,
                     seed=seed,
                     tiled=False,
                 )
@@ -131,7 +120,7 @@ class GenesisPipeline:
 
             if not output_path:
                 safe_name = "".join(c if c.isalnum() else "_" for c in prompt[:30])
-                output_path = f"outputs/genesis_{duration_sec}s_{safe_name}.mp4"
+                output_path = str(OUTPUTS_DIR / f"genesis_{duration_sec}s_{safe_name}.mp4")
 
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             save_video(video, output_path, fps=fps, quality=5)

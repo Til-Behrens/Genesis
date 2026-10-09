@@ -2,6 +2,7 @@
 Centralized configuration management for Genesis.
 """
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import yaml
 import logging
@@ -23,19 +24,93 @@ DATASET_ROOT = PROJECT_ROOT / "src" / "finetuning" / "dataset"
 RAW_VIDEOS_DIR = DATASET_ROOT / "raw_videos"
 CUT_VIDEOS_DIR = DATASET_ROOT / "cut_videos"
 METADATA_FILE = DATASET_ROOT / "metadata.jsonl"
+DIFFSYNTH_METADATA_FILE = DATASET_ROOT / "metadata_diffsynth.jsonl"
 
 # Output paths
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 LOGS_DIR = OUTPUTS_DIR / "logs"
 LORA_CHECKPOINTS_DIR = PROJECT_ROOT / "models" / "lora_checkpoints"
 
-# Model IDs
-WAN_MODEL_MAP = {
-    "14B": "Wan-AI/Wan2.2-T2V-A14B",
-    "14B-2.1": "Wan-AI/Wan2.1-T2V-14B",
-    "5B": "Wan-AI/Wan2.2-TI2V-5B",
-    "1.3B": "Wan-AI/Wan2.1-T2V-1.3B",
+
+@dataclass(frozen=True)
+class TrainRun:
+    """One DiffSynth training job; mixture-of-experts models need one per expert."""
+
+    name: str
+    dit_pattern: str
+    min_timestep_boundary: float = 0.0
+    max_timestep_boundary: float = 1.0
+
+
+@dataclass(frozen=True)
+class WanModelSpec:
+    """Files and defaults for one Wan checkpoint, shared by generation and training.
+
+    Generation loads text encoder and VAE as safetensors from `SHARED_COMPONENTS_ID`
+    (required for disk offload); training uses the original files of the model repo,
+    as in DiffSynth's training recipes.
+    """
+
+    model_id: str
+    dit_patterns: tuple[str, ...]
+    vae_file: str
+    train_vae_file: str
+    height: int
+    width: int
+    num_inference_steps: int
+    fps: int
+    train_runs: tuple[TrainRun, ...]
+
+
+SHARED_COMPONENTS_ID = os.getenv(
+    "GENESIS_DIFFSYNTH_SHARED_MODEL_ID",
+    "DiffSynth-Studio/Wan-Series-Converted-Safetensors",
+)
+TOKENIZER_MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B"
+
+_DIT = "diffusion_pytorch_model*.safetensors"
+
+# keys are the labels shown in the ui
+WAN_MODELS = {
+    "5B": WanModelSpec(
+        model_id="Wan-AI/Wan2.2-TI2V-5B",
+        dit_patterns=(_DIT,),
+        vae_file="Wan2.2_VAE.safetensors",
+        train_vae_file="Wan2.2_VAE.pth",
+        height=704, width=1280, num_inference_steps=50, fps=24,
+        train_runs=(TrainRun("dit", _DIT),),
+    ),
+    "14B": WanModelSpec(
+        model_id="Wan-AI/Wan2.2-T2V-A14B",
+        dit_patterns=(f"high_noise_model/{_DIT}", f"low_noise_model/{_DIT}"),
+        vae_file="Wan2.1_VAE.safetensors",
+        train_vae_file="Wan2.1_VAE.pth",
+        height=720, width=1280, num_inference_steps=20, fps=16,
+        # boundaries from diffsynth's a14b lora recipe
+        train_runs=(
+            TrainRun("high_noise", f"high_noise_model/{_DIT}", 0.0, 0.417),
+            TrainRun("low_noise", f"low_noise_model/{_DIT}", 0.417, 1.0),
+        ),
+    ),
+    "14B-2.1": WanModelSpec(
+        model_id="Wan-AI/Wan2.1-T2V-14B",
+        dit_patterns=(_DIT,),
+        vae_file="Wan2.1_VAE.safetensors",
+        train_vae_file="Wan2.1_VAE.pth",
+        height=720, width=1280, num_inference_steps=20, fps=16,
+        train_runs=(TrainRun("dit", _DIT),),
+    ),
+    "1.3B": WanModelSpec(
+        model_id="Wan-AI/Wan2.1-T2V-1.3B",
+        dit_patterns=(_DIT,),
+        vae_file="Wan2.1_VAE.safetensors",
+        train_vae_file="Wan2.1_VAE.pth",
+        height=480, width=832, num_inference_steps=40, fps=16,
+        train_runs=(TrainRun("dit", _DIT),),
+    ),
 }
+
+WAN_MODEL_MAP = {key: spec.model_id for key, spec in WAN_MODELS.items()}
 
 # Optional DiffSynth-Studio root. If empty, training auto-detects from installed package.
 DIFFSYNTH_ROOT = os.getenv("GENESIS_DIFFSYNTH_ROOT", "")
@@ -73,7 +148,7 @@ DEFAULT_TRAINING_CONFIG = {
     # Note: epochs and learning_rate are passed explicitly from UI.
     "dataset_repeat": 100,
     "dataset_num_workers": 0,
-    "data_file_keys": "file_name",
+    "data_file_keys": "video",
     "lora_base_model": "dit",
     "lora_target_modules": "q,k,v,o,ffn.0,ffn.2",
     "lora_rank": 32,
